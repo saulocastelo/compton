@@ -6024,6 +6024,7 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
       P_CASEBOOL(315, no_fading_destroyed_argb);
       P_CASEBOOL(316, force_win_blend);
 	  case 321: {
+        ps->o.tommy_flag = true;
 		gtk_init(NULL, NULL);
 		GdkRGBA bg_color_win, bg_color_menu;
 		GtkWidget* win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -6037,8 +6038,9 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
 		printf("I have got some colors from GTK! (%g,%g,%g) and (%g,%g,%g)\n",
 			bg_color_win.red, bg_color_win.green, bg_color_win.blue,
 			bg_color_menu.red,bg_color_menu.green,bg_color_menu.blue);
-		const int N = 2;
-		double x[2][3] = { { 0.807, 0.807, 0.807 }, { 0.953, 0.953, 0.953 } };
+		const int N = 3;
+		// Colors from the DeviantArt theme.
+		double x[3][3] = { { 0.807, 0.807, 0.807 }, { 0.953, 0.953, 0.953 }, { 0.2509, 0.3255, 0.2902 } };
 		x[0][0] = bg_color_win.red; x[0][1] = bg_color_win.green; x[0][2] = bg_color_win.blue;
 		x[1][0] = bg_color_menu.red;x[1][1] = bg_color_menu.green;x[1][2] = bg_color_menu.blue;
 	    const char* part1 = 
@@ -6047,8 +6049,8 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
 			"uniform sampler2D tex;\n"
 			"void main() {\n"
 			"  vec4 c = texture2D(tex, vec2(gl_TexCoord[0].x, gl_TexCoord[0].y));\n"
-			"  float eps = 0.018f;\n"
-			"  float eps1 = 0.0f;\n"
+			"  float eps = 0.018;\n"
+			"  float eps1 = 0.0;\n"
 			"  if (invert_color)\n"
 			" 	 c = vec4(vec3(c.a, c.a, c.a) - vec3(c), c.a);\n"
 			"  if(";
@@ -6057,9 +6059,9 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
 		int offset = 0;
 	  	for(int n=0; n<N; n++) {
 			double red = x[n][0], green = x[n][1], blue = x[n][2];
-			sprintf(tmp, "  (c.r > %g+eps1-eps && c.r < %g+eps1+eps &&\n"
-				"   c.g > %g+eps1-eps && c.g < %g+eps1+eps &&\n"
-				"   c.b > %g+eps1-eps && c.b < %g+eps1+eps)",
+			sprintf(tmp, "  (c.r > %.3f+eps1-eps && c.r < %.3f+eps1+eps &&\n"
+				"   c.g > %.3f+eps1-eps && c.g < %.3f+eps1+eps &&\n"
+				"   c.b > %.3f+eps1-eps && c.b < %.3f+eps1+eps)",
 				red, red, green, green, blue, blue);
 			if (n < N-1) {
 				unsigned l = strlen(tmp);
