@@ -47,3 +47,4 @@ doxygen/
 .ycm_extra_conf.pyc
 /src/backtrace-symbols.[ch]
 /compton*.trace
+.idea

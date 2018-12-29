@@ -456,8 +456,11 @@ make_shadow(session_t *ps, double opacity,
  */
 static bool
 win_build_shadow(session_t *ps, win *w, double opacity) {
-  const int width = w->widthb;
-  const int height = w->heightb;
+//  const int width = w->widthb;
+//  const int height = w->heightb;
+
+  const int width = w->newW; // TODO!
+  const int height = w->newH;
 
   XImage *shadow_image = NULL;
   Pixmap shadow_pixmap = None, shadow_pixmap_argb = None;
@@ -1110,6 +1113,56 @@ paint_preprocess(session_t *ps, win *list) {
     bool to_paint = true;
     const winmode_t mode_old = w->mode;
 
+
+    bool posChanged = (w->oldX != -10000 && w->oldY != -10000 && w->oldW != 0 && w->oldH != 0)
+                   && (w->a.x != w->newX || w->a.y != w->newY || w->a.width != w->newW || w->a.height != w->newH);
+
+    if (posChanged) {
+      float t      = get_time_ms();
+      float moveDx = (t - w->moveTimeX) / ps->o.transition_length;
+      float moveDy = (t - w->moveTimeY) / ps->o.transition_length;
+      float moveDw = (t - w->moveTimeW) / ps->o.transition_length;
+      float moveDh = (t - w->moveTimeH) / ps->o.transition_length;
+      if (moveDx >= 1.0) moveDx = 1.0;
+      if (moveDy >= 1.0) moveDy = 1.0;
+      if (moveDw >= 1.0) moveDw = 1.0;
+      if (moveDh >= 1.0) moveDh = 1.0;
+
+      float q = pow (moveDx, ps->o.transition_pow_x);
+      float k = pow (moveDy, ps->o.transition_pow_y);
+      float g = pow (moveDw, ps->o.transition_pow_w);
+      float z = pow (moveDh, ps->o.transition_pow_h);
+
+      float x = (float) w->oldX * (1-q) + (float) w->newX * q;
+      float y = (float) w->oldY * (1-k) + (float) w->newY * k;
+      float W = (float) w->oldW * (1-g) + (float) w->newW * g;
+      float h = (float) w->oldH * (1-z) + (float) w->newH * z;
+
+      add_damage_win(ps, w);
+      w->a.x = (int) x;
+      w->a.y = (int) y;
+      if (ps->o.size_transition) {
+        w->a.width  = (int) W;
+        w->a.height = (int) h;
+      }
+
+      /* w->to_paint = true; */
+      w->mode = WMODE_ARGB;
+      ps->idling = false;
+    }
+    if ((w->shadow && posChanged) || (ps->o.size_transition && w->damaged)) {
+      free_region(ps, &w->extents);
+      free_region(ps, &w->border_size);
+      w->extents = win_extents(ps, w);
+      calc_win_size(ps, w);
+
+      if (ps->shape_exists && ps->o.shadow_ignore_shaped
+            && ps->o.detect_rounded_corners && w->bounding_shaped)
+          win_update_shape(ps, w);
+    }
+    /* add_damage_win(ps, w); */
+
+
     // In case calling the fade callback function destroys this window
     next = w->next;
     opacity_t opacity_old = w->opacity;
@@ -1603,8 +1656,12 @@ win_paint_win(session_t *ps, win *w, XserverRegion reg_paint,
 
   const int x = w->a.x;
   const int y = w->a.y;
-  const int wid = w->widthb;
-  const int hei = w->heightb;
+  // const int wid = w->widthb;
+  // const int hei = w->heightb;
+
+//  // TODO: This will break if the user have window borders
+ const int wid = w->a.width;
+ const int hei = w->a.height;
 
   Picture pict = w->paint.pict;
 
@@ -1934,6 +1991,8 @@ paint_all(session_t *ps, XserverRegion region, XserverRegion region_real, win *t
         reg_paint = region;
     }
 
+    reg_paint = region;
+
     {
       reg_data_t cache_reg = REG_DATA_INIT;
       if (!is_region_empty(ps, reg_paint, &cache_reg)) {
@@ -2169,6 +2228,15 @@ map_win(session_t *ps, Window id) {
 
   w->a.map_state = IsViewable;
 
+
+  if (!w->isOld) {
+    w->oldX = -10000;
+    w->oldY = -10000;
+    w->oldW = 0;
+    w->oldH = 0;
+  }
+
+
   cxinerama_win_upd_scr(ps, w);
 
   // Call XSelectInput() before reading properties so that no property
@@ -2259,6 +2327,7 @@ finish_map_win(session_t *ps, win *w) {
 static void
 finish_unmap_win(session_t *ps, win *w) {
   w->damaged = false;
+  w->isOld = true;
 
   w->in_openclose = false;
 
@@ -2923,6 +2992,11 @@ add_win(session_t *ps, Window id, Window prev) {
     .invert_color_force = UNSET,
 
     .blur_background = false,
+
+    .oldX = -10000,
+    .oldY = -10000,
+    .oldW = 0,
+    .oldH = 0,
   };
 
   // Reject overlay window and already added windows
@@ -3124,6 +3198,111 @@ configure_win(session_t *ps, XConfigureEvent *ce) {
   if (!w)
     return;
 
+
+  float t = get_time_ms();
+  if (w->oldX == -10000 && w->oldY == -10000 && w->oldW == 0 && w->oldH == 0) {
+    if (!w->isOld) {
+      /* w->isOld = true; */
+
+      if (ps->o.spawn_center_screen) {
+        w->oldX = ps->root_width/2;
+        w->oldY = ps->root_height/2;
+        w->oldW = 1;
+        w->oldH = 1;
+      } else if (ps->o.spawn_center) {
+        w->oldX = ce->x + ce->width/2;
+        w->oldY = ce->y + ce->height/2;
+        w->oldW = 1;
+        w->oldH = 1;
+      } else {
+        w->oldX = ce->x;
+        w->oldY = ce->y;
+        w->oldW = ce->width;
+        w->oldH = ce->height;
+      }
+    } else {
+        w->oldX = ce->x;
+        w->oldY = ce->y;
+        w->oldW = ce->width;
+        w->oldH = ce->height;
+    }
+
+    w->newX = ce->x;
+    w->newY = ce->y;
+    w->newW = ce->width;
+    w->newH = ce->height;
+    w->moveTimeX = t;
+    w->moveTimeY = t;
+    w->moveTimeW = t;
+    w->moveTimeH = t;
+  } else {
+    if (w->newX == w->a.x && w->newY == w->a.y) {
+      w->oldX = w->a.x;
+      w->oldY = w->a.y;
+      w->oldW = w->a.width;
+      w->oldH = w->a.height;
+      w->moveTimeX = t;
+      w->moveTimeY = t;
+      w->moveTimeW = t;
+      w->moveTimeH = t;
+    }
+    if (w->newX != ce->x || w->newY != ce->y || w->newW != ce->width || w->newH != ce->height) {
+      float t      = get_time_ms();
+      float moveDx = ((float) t - w->moveTimeX) / ps->o.transition_length;
+      float moveDy = ((float) t - w->moveTimeY) / ps->o.transition_length;
+      float moveDw = ((float) t - w->moveTimeW) / ps->o.transition_length;
+      float moveDh = ((float) t - w->moveTimeH) / ps->o.transition_length;
+
+      if (w->moveTimeX != 0.0 && moveDx < 1.0 && w->oldX != w->newX) {
+        float oldMoveDx = pow((float) (w->newX - w->a.x) / (float) (w->newX - ce->x), 1 / ps->o.transition_pow_x);
+        float fakeT     = (t - oldMoveDx * (float) ps->o.transition_length);
+        /* printf("X: %f,%f\n", fakeT, t); */
+        w->moveTimeX    = isnanf(fakeT)? t : fakeT;
+      } else {
+        w->moveTimeX    = t;
+      }
+      if (w->moveTimeY != 0.0 && moveDy < 1.0 && w->oldY != w->newY) {
+        float oldMoveDy = pow((float) (w->newY - w->a.y) / (float) (w->newY - ce->y), 1 / ps->o.transition_pow_y);
+        float fakeT     = (t - oldMoveDy * (float) ps->o.transition_length);
+        /* printf("Y: %f,%f\n", fakeT, t); */
+        w->moveTimeY    = isnanf(fakeT)? t : fakeT;
+      } else {
+        w->moveTimeY    = t;
+      }
+      if (w->moveTimeW != 0.0 && moveDw < 1.0 && w->oldW != w->newW) {
+        float oldMoveDw = pow((float) (w->newW - w->a.width) / (float) (w->newW - ce->width), 1 / ps->o.transition_pow_w);
+        float fakeT     = (t - oldMoveDw * (float) ps->o.transition_length);
+        /* printf("Y: %f,%f\n", fakeT, t); */
+        w->moveTimeW    = isnanf(fakeT)? t : fakeT;
+      } else {
+        w->moveTimeW    = t;
+      }
+      if (w->moveTimeH != 0.0 && moveDh < 1.0 && w->oldH != w->newH) {
+        float oldMoveDh = pow((float) (w->newH - w->a.height) / (float) (w->newH - ce->height), 1 / ps->o.transition_pow_h);
+        float fakeT     = (t - oldMoveDh * (float) ps->o.transition_length);
+        /* printf("Y: %f,%f\n", fakeT, t); */
+        w->moveTimeH    = isnanf(fakeT)? t : fakeT;
+      } else {
+        w->moveTimeH    = t;
+      }
+
+      w->oldX = w->newX;
+      w->oldY = w->newY;
+      w->oldW = w->newW;
+      w->oldH = w->newH;
+      w->newX = ce->x;
+      w->newY = ce->y;
+      w->newW = ce->width;
+      w->newH = ce->height;
+
+      if (ps->o.no_scale_down && w->newW < w->oldW) { w->oldW = w->newW; }
+      if (ps->o.no_scale_down && w->newH < w->oldH) { w->oldH = w->newH; }
+    }
+  }
+
+
+
+
   if (w->a.map_state == IsUnmapped) {
     /* save the configure event for when the window maps */
     w->need_configure = true;
@@ -3156,8 +3335,8 @@ configure_win(session_t *ps, XConfigureEvent *ce) {
       free_region(ps, &w->border_size);
     }
 
-    w->a.x = ce->x;
-    w->a.y = ce->y;
+//    w->a.x = ce->x;
+//    w->a.y = ce->y;
 
     if (w->a.width != ce->width || w->a.height != ce->height
         || w->a.border_width != ce->border_width)
@@ -5079,10 +5258,10 @@ parse_matrix(session_t *ps, const char *src, const char **endptr) {
     printf_errf("(): Width/height not odd.");
     goto parse_matrix_err;
   }
-  if (wid > 16 || hei > 16) {
-    printf_errf("(): Matrix width/height too large.");
-    goto parse_matrix_err;
-  }
+  // if (wid > 16 || hei > 16) {
+    // printf_errf("(): Matrix width/height too large.");
+    // goto parse_matrix_err;
+  // }
 
   // Allocate memory
   matrix = calloc(wid * hei + 2, sizeof(XFixed));
@@ -5513,6 +5692,34 @@ parse_config(session_t *ps, struct options_tmp *pcfgtmp) {
   // -O (fade_out_step)
   if (config_lookup_float(&cfg, "fade-out-step", &dval))
     ps->o.fade_out_step = normalize_d(dval) * OPAQUE;
+
+
+   // --transition-length
+    if (lcfg_lookup_int(&cfg, "transition-length", &ival))
+      ps->o.transition_length = ival;
+    // --transition-pow-x
+    if (config_lookup_float(&cfg, "transition-pow-x", &dval))
+      ps->o.transition_pow_x = dval;
+    // --transition-pow-y
+    if (config_lookup_float(&cfg, "transition-pow-y", &dval))
+      ps->o.transition_pow_y = dval;
+    // --transition-pow-w
+    if (config_lookup_float(&cfg, "transition-pow-w", &dval))
+      ps->o.transition_pow_w = dval;
+    // --transition-pow-h
+    if (config_lookup_float(&cfg, "transition-pow-h", &dval))
+      ps->o.transition_pow_h = dval;
+    // --size-transition
+    lcfg_lookup_bool(&cfg, "size-transition", &ps->o.size_transition);
+    // --spawn-center-screen
+    lcfg_lookup_bool(&cfg, "spawn-center-screen", &ps->o.spawn_center_screen);
+    // --spawn-center
+    lcfg_lookup_bool(&cfg, "spawn-center", &ps->o.spawn_center);
+    // --no-scale-down
+    lcfg_lookup_bool(&cfg, "no-scale-down", &ps->o.no_scale_down);
+
+
+
   // -r (shadow_radius)
   lcfg_lookup_int(&cfg, "shadow-radius", &ps->o.shadow_radius);
   // -o (shadow_opacity)
@@ -7013,6 +7220,20 @@ session_init(session_t *ps_old, int argc, char **argv) {
       .backend = BKEND_XRENDER,
       .glx_no_stencil = false,
       .glx_copy_from_front = false,
+
+
+            .transition_length = 300,
+            .transition_pow_x = 1.5,
+            .transition_pow_y = 1.5,
+            .transition_pow_w = 1.5,
+            .transition_pow_h = 1.5,
+            .size_transition = true,
+            .no_scale_down = false,
+            .spawn_center_screen = false,
+
+
+
+
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
       .glx_prog_win = GLX_PROG_MAIN_INIT,
 #endif
@@ -7180,6 +7401,9 @@ session_init(session_t *ps_old, int argc, char **argv) {
 
   // Allocate a session and copy default values into it
   session_t *ps = malloc(sizeof(session_t));
+  if(!ps){
+    printf_errfq(1, "(): Can't allocate session.");
+  }
   memcpy(ps, &s_def, sizeof(session_t));
   ps_g = ps;
   ps->ignore_tail = &ps->ignore_head;
