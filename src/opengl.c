@@ -107,9 +107,18 @@ glx_init(session_t *ps, bool need_render) {
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
     for (int i = 0; i < MAX_BLUR_PASS; ++i) {
       glx_blur_pass_t *ppass = &ps->psglx->blur_passes[i];
-      ppass->unifm_factor_center = -1;
       ppass->unifm_offset_x = -1;
       ppass->unifm_offset_y = -1;
+      ppass->unifm_opacity = -1;
+      ppass->unifm_offset = -1;
+      ppass->unifm_halfpixel = -1;
+      ppass->unifm_fulltex = -1;
+    }
+
+    glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+    for (int i = 0; i < MAX_BLUR_PASS; ++i) {
+      pbc->fbos[i] = 0;
+      pbc->textures[i] = 0;
     }
 #endif
   }
@@ -315,6 +324,8 @@ glx_destroy(session_t *ps) {
     if (ppass->prog)
       glDeleteProgram(ppass->prog);
   }
+  glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+  free_glx_bc(ps, pbc);
 
   glx_free_prog_main(ps, &ps->o.glx_prog_win);
 
@@ -374,25 +385,24 @@ glx_on_root_change(session_t *ps) {
   glLoadIdentity();
 }
 
+#ifdef CONFIG_VSYNC_OPENGL_GLSL
 /**
- * Initialize GLX blur filter.
+ * Initialize GLX blur filter for the convolution blur.
  */
 bool
-glx_init_blur(session_t *ps) {
+glx_init_conv_blur(session_t *ps) {
   assert(ps->o.blur_kerns[0]);
 
-  // Allocate PBO if more than one blur kernel is present
+  // Allocate FBO if more than one blur kernel is present
   if (ps->o.blur_kerns[1]) {
 #ifdef CONFIG_VSYNC_OPENGL_FBO
-    // Try to generate a framebuffer
-    GLuint fbo = 0;
-    glGenFramebuffers(1, &fbo);
-    if (!fbo) {
+    glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+    glGenFramebuffers(1, pbc->fbos);
+    if (!pbc->fbos) {
       printf_errf("(): Failed to generate Framebuffer. Cannot do "
           "multi-pass blur with GLX backend.");
       return false;
     }
-    glDeleteFramebuffers(1, &fbo);
 #else
     printf_errf("(): FBO support not compiled in. Cannot do multi-pass blur "
         "with GLX backend.");
@@ -400,7 +410,45 @@ glx_init_blur(session_t *ps) {
 #endif
   }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
+  // Allocate textures if needed
+  {
+    GLenum tex_tgt = GL_TEXTURE_RECTANGLE;
+    if (ps->psglx->has_texture_non_power_of_two)
+      tex_tgt = GL_TEXTURE_2D;
+
+    glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+    if (!pbc->textures[0])
+      pbc->textures[0] = glx_gen_texture(ps, tex_tgt, ps->root_width, ps->root_height);
+    if (ps->o.blur_kerns[1] && !pbc->textures[1])
+      pbc->textures[1] = glx_gen_texture(ps, tex_tgt, ps->root_width, ps->root_height);
+
+    if (!pbc->textures[0] || (ps->o.blur_kerns[1] && !pbc->textures[1])) {
+      printf_errf("(): Failed to allocate texture.");
+      return false;
+    }
+    pbc->width[0] = pbc->width[1] = ps->root_width;
+    pbc->height[0] = pbc->height[1] = ps->root_height;
+
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+    // Bind texture to framebuffer
+    if (pbc->fbos[0]) {
+      static const GLenum DRAWBUFS[2] = { GL_COLOR_ATTACHMENT0 };
+      glBindFramebuffer(GL_FRAMEBUFFER, pbc->fbos[0]);
+      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+          GL_TEXTURE_2D, pbc->textures[1], 0);
+      glDrawBuffers(1, DRAWBUFS);
+      if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+          != GL_FRAMEBUFFER_COMPLETE) {
+        printf_errf("(): Framebuffer attachment failed.");
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return false;
+      }
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    }
+#endif
+  }
+
+  // Compile blur shader
   {
     char *lc_numeric_old = mstrcpy(setlocale(LC_NUMERIC, NULL));
     // Enforce LC_NUMERIC locale "C" here to make sure decimal point is sane
@@ -412,7 +460,7 @@ glx_init_blur(session_t *ps) {
       "%s"
       "uniform float offset_x;\n"
       "uniform float offset_y;\n"
-      "uniform float factor_center;\n"
+      "uniform float opacity;\n"
       "uniform %s tex_scr;\n"
       "\n"
       "void main() {\n"
@@ -422,8 +470,9 @@ glx_init_blur(session_t *ps) {
     static const char *FRAG_SHADER_BLUR_ADD_GPUSHADER4 =
       "  sum += float(%.7g) * %sOffset(tex_scr, vec2(gl_TexCoord[0].x, gl_TexCoord[0].y), ivec2(%d, %d));\n";
     static const char *FRAG_SHADER_BLUR_SUFFIX =
-      "  sum += %s(tex_scr, vec2(gl_TexCoord[0].x, gl_TexCoord[0].y)) * factor_center;\n"
-      "  gl_FragColor = sum / (factor_center + float(%.7g));\n"
+      "  sum += %s(tex_scr, vec2(gl_TexCoord[0].x, gl_TexCoord[0].y));\n"
+      "  gl_FragColor = sum / (float(%.7g));\n"
+      "  gl_FragColor.a = opacity;\n"
       "}\n";
 
     const bool use_texture_rect = !ps->psglx->has_texture_non_power_of_two;
@@ -463,7 +512,7 @@ glx_init_blur(session_t *ps) {
           pc += strlen(pc);
           assert(strlen(shader_str) < len);
 
-          double sum = 0.0;
+          double sum = 1.0;
           for (int j = 0; j < hei; ++j) {
             for (int k = 0; k < wid; ++k) {
               if (hei / 2 == j && wid / 2 == k)
@@ -505,7 +554,7 @@ glx_init_blur(session_t *ps) {
       } \
     }
 
-      P_GET_UNIFM_LOC("factor_center", unifm_factor_center);
+      P_GET_UNIFM_LOC("opacity", unifm_opacity);
       if (!ps->o.glx_use_gpushader4) {
         P_GET_UNIFM_LOC("offset_x", unifm_offset_x);
         P_GET_UNIFM_LOC("offset_y", unifm_offset_y);
@@ -524,6 +573,260 @@ glx_init_blur(session_t *ps) {
   glx_check_err(ps);
 
   return true;
+}
+
+/**
+ * Initialize GLX blur filter for the dual-filter kawase blur.
+ */
+bool
+glx_init_dualkawase_blur(session_t *ps) {
+  assert(ps->o.blur_strength.iterations);
+  int iterations = ps->o.blur_strength.iterations;
+  assert(iterations < MAX_BLUR_PASS);
+
+  // Allocate required FBOs for dual-filter support
+  {
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+    glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+    glGenFramebuffers(iterations, pbc->fbos);
+    if (!pbc->fbos) {
+      printf_errf("(): Failed to generate Framebuffer. Cannot do "
+          "multi-pass blur with GLX backend.");
+      return false;
+    }
+#else
+    printf_errf("(): FBO support not compiled in. Cannot do multi-pass blur "
+        "with GLX backend.");
+    return false;
+#endif
+  }
+
+  // Allocate textures if needed and bind to the respective framebuffer
+  {
+    GLenum tex_tgt = GL_TEXTURE_RECTANGLE;
+    if (ps->psglx->has_texture_non_power_of_two)
+      tex_tgt = GL_TEXTURE_2D;
+
+    // Allocate scaled texture
+    glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
+
+    int tex_width;
+    int tex_height;
+    for (int i = 0; i <= iterations; ++i) {
+      if (!pbc->textures[i]) {
+        tex_width = ps->root_width / (1 << (i));
+        tex_height = ps->root_height / (1 << (i));
+        pbc->textures[i] = glx_gen_texture(ps, tex_tgt, tex_width, tex_height);
+        pbc->width[i] = tex_width;
+        pbc->height[i] = tex_height;
+      }
+      if (!pbc->textures[i]) {
+        printf_errf("(): Failed to allocate texture.");
+        return false;
+      }
+
+      // Bind texture to framebuffer
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+      if ((i > 0) && pbc->fbos[i-1]) {
+        static const GLenum DRAWBUFS[2] = { GL_COLOR_ATTACHMENT0 };
+        glBindFramebuffer(GL_FRAMEBUFFER, pbc->fbos[i-1]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_TEXTURE_2D, pbc->textures[i], 0);
+        glDrawBuffers(1, DRAWBUFS);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
+            != GL_FRAMEBUFFER_COMPLETE) {
+          printf_errf("(): Framebuffer attachment failed.");
+          glBindFramebuffer(GL_FRAMEBUFFER, 0);
+          return false;
+        }
+      }
+#endif
+    }
+
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#endif
+  }
+
+  // Compile blur shader
+  {
+    char *lc_numeric_old = mstrcpy(setlocale(LC_NUMERIC, NULL));
+    // Enforce LC_NUMERIC locale "C" here to make sure decimal point is sane
+    // Thanks to hiciu for reporting.
+    setlocale(LC_NUMERIC, "C");
+
+    static const char *FRAG_SHADER_PREFIX =
+      "#version 110\n"
+      "%s"  // extensions
+      "uniform float offset;\n"
+      "uniform float opacity;\n"
+      "uniform vec2 halfpixel;\n"
+      "uniform vec2 fulltex;\n"
+      "uniform %s tex_scr;\n" // sampler2D | sampler2DRect
+      "\n"
+      "vec4 clamp_tex(vec2 uv)\n"
+      "{\n"
+      "  return %s(tex_scr, clamp(uv, vec2(0), fulltex));\n" // texture2D | texture2DRect
+      "}\n"
+      "\n"
+      "void main()\n"
+      "{\n"
+      "  vec2 uv = (gl_FragCoord.xy / fulltex);\n"
+      "\n";
+
+    // Fragment shader (Dual Kawase Blur) - Downsample
+    static const char *FRAG_SHADER_KAWASE_DOWN =
+      "  vec4 sum = clamp_tex(uv) * 4.0;\n"
+      "  sum += clamp_tex(uv - halfpixel.xy * offset);\n"
+      "  sum += clamp_tex(uv + halfpixel.xy * offset);\n"
+      "  sum += clamp_tex(uv + vec2(halfpixel.x, -halfpixel.y) * offset);\n"
+      "  sum += clamp_tex(uv - vec2(halfpixel.x, -halfpixel.y) * offset);\n"
+      "\n"
+      "  gl_FragColor = sum / 8.0;\n"
+      "}\n";
+
+    // Fragment shader (Dual Kawase Blur) - Upsample
+    static const char *FRAG_SHADER_KAWASE_UP =
+      "  vec4 sum = clamp_tex(uv + vec2(-halfpixel.x * 2.0, 0.0) * offset);\n"
+      "  sum += clamp_tex(uv + vec2(-halfpixel.x, halfpixel.y) * offset) * 2.0;\n"
+      "  sum += clamp_tex(uv + vec2(0.0, halfpixel.y * 2.0) * offset);\n"
+      "  sum += clamp_tex(uv + vec2(halfpixel.x, halfpixel.y) * offset) * 2.0;\n"
+      "  sum += clamp_tex(uv + vec2(halfpixel.x * 2.0, 0.0) * offset);\n"
+      "  sum += clamp_tex(uv + vec2(halfpixel.x, -halfpixel.y) * offset) * 2.0;\n"
+      "  sum += clamp_tex(uv + vec2(0.0, -halfpixel.y * 2.0) * offset);\n"
+      "  sum += clamp_tex(uv + vec2(-halfpixel.x, -halfpixel.y) * offset) * 2.0;\n"
+      "\n"
+      "  gl_FragColor = sum / 12.0;\n"
+      "  gl_FragColor.a = opacity;\n"
+      "}\n";
+
+    const bool use_texture_rect = !ps->psglx->has_texture_non_power_of_two;
+    const char *sampler_type = (use_texture_rect ?
+        "sampler2DRect": "sampler2D");
+    const char *texture_func = (use_texture_rect ?
+        "texture2DRect": "texture2D");
+    char *extension = mstrcpy("");
+    if (use_texture_rect)
+      mstrextend(&extension, "#extension GL_ARB_texture_rectangle : require\n");
+
+    // Build kawase downsample shader
+    glx_blur_pass_t *down_pass = &ps->psglx->blur_passes[0];
+    {
+      int len = strlen(FRAG_SHADER_PREFIX) + strlen(extension) + strlen(sampler_type) + strlen(texture_func) + strlen(FRAG_SHADER_KAWASE_DOWN) + 1;
+      char *shader_str = calloc(len, sizeof(char));
+      if (!shader_str) {
+        printf_errf("(): Failed to allocate %d bytes for shader string.", len);
+        return false;
+      }
+
+      char *pc = shader_str;
+      sprintf(pc, FRAG_SHADER_PREFIX, extension, sampler_type, texture_func);
+      pc += strlen(pc);
+      assert(strlen(shader_str) < len);
+
+      sprintf(pc, FRAG_SHADER_KAWASE_DOWN);
+      assert(strlen(shader_str) < len);
+      down_pass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
+      free(shader_str);
+
+      if (!down_pass->frag_shader) {
+        printf_errf("(): Failed to create dual_kawase downsample fragment shader.");
+        return false;
+      }
+
+      // Build program
+      down_pass->prog = glx_create_program(&down_pass->frag_shader, 1);
+      if (!down_pass->prog) {
+        printf_errf("(): Failed to create GLSL program.");
+        return false;
+      }
+
+      // Get uniform addresses
+#define P_GET_UNIFM_LOC(name, target) { \
+      down_pass->target = glGetUniformLocation(down_pass->prog, name); \
+      if (down_pass->target < 0) { \
+        printf_errf("(): Failed to get location of dual_kawase downsample uniform '" name "'. Might be troublesome."); \
+      } \
+    }
+      P_GET_UNIFM_LOC("offset", unifm_offset);
+      P_GET_UNIFM_LOC("halfpixel", unifm_halfpixel);
+      P_GET_UNIFM_LOC("fulltex", unifm_fulltex);
+#undef P_GET_UNIFM_LOC
+    }
+
+    // Build kawase upsample shader
+    glx_blur_pass_t *up_pass = &ps->psglx->blur_passes[1];
+    {
+      int len = strlen(FRAG_SHADER_PREFIX) + strlen(extension) + strlen(sampler_type) + strlen(texture_func) + strlen(FRAG_SHADER_KAWASE_UP) + 1;
+      char *shader_str = calloc(len, sizeof(char));
+      if (!shader_str) {
+        printf_errf("(): Failed to allocate %d bytes for shader string.", len);
+        return false;
+      }
+
+      char *pc = shader_str;
+      sprintf(pc, FRAG_SHADER_PREFIX, extension, sampler_type, texture_func);
+      pc += strlen(pc);
+      assert(strlen(shader_str) < len);
+
+      sprintf(pc, FRAG_SHADER_KAWASE_UP);
+      assert(strlen(shader_str) < len);
+      up_pass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
+      free(shader_str);
+
+      if (!up_pass->frag_shader) {
+        printf_errf("(): Failed to create dual_kawase upsample fragment shader.");
+        return false;
+      }
+
+      // Build program
+      up_pass->prog = glx_create_program(&up_pass->frag_shader, 1);
+      if (!up_pass->prog) {
+        printf_errf("(): Failed to create GLSL program.");
+        return false;
+      }
+
+      // Get uniform addresses
+#define P_GET_UNIFM_LOC(name, target) { \
+      up_pass->target = glGetUniformLocation(up_pass->prog, name); \
+      if (up_pass->target < 0) { \
+        printf_errf("(): Failed to get location of dual_kawase upsample uniform '" name "'. Might be troublesome."); \
+      } \
+    }
+      P_GET_UNIFM_LOC("offset", unifm_offset);
+      P_GET_UNIFM_LOC("opacity", unifm_opacity);
+      P_GET_UNIFM_LOC("halfpixel", unifm_halfpixel);
+      P_GET_UNIFM_LOC("fulltex", unifm_fulltex);
+#undef P_GET_UNIFM_LOC
+    }
+
+    free(extension);
+
+    // Restore LC_NUMERIC
+    setlocale(LC_NUMERIC, lc_numeric_old);
+    free(lc_numeric_old);
+  }
+
+  glx_check_err(ps);
+
+  return true;
+}
+#endif
+
+/**
+ * Initialize GLX blur filter for the selected blur algorithm.
+ */
+bool
+glx_init_blur(session_t *ps) {
+#ifdef CONFIG_VSYNC_OPENGL_GLSL
+  switch (ps->o.blur_method) {
+    case BLRMTHD_CONV:
+      return glx_init_conv_blur(ps);
+    case BLRMTHD_DUALKAWASE:
+      return glx_init_dualkawase_blur(ps);
+    default:
+      return false;
+  }
 #else
   printf_errf("(): GLSL support not compiled in. Cannot do blur with GLX backend.");
   return false;
@@ -709,6 +1012,16 @@ glx_cmp_fbconfig(session_t *ps,
   if (!pfbc_a)
     return -1;
   if (!pfbc_b)
+    return 1;
+  int tmpattr;
+
+  // Avoid 10-bit colors
+  glXGetFBConfigAttrib(ps->dpy, pfbc_a->cfg, GLX_RED_SIZE, &tmpattr);
+  if (tmpattr != 8)
+    return -1;
+
+  glXGetFBConfigAttrib(ps->dpy, pfbc_b->cfg, GLX_RED_SIZE, &tmpattr);
+  if (tmpattr != 8)
     return 1;
 
 #define P_CMPATTR_LT(attr) { if ((result = glx_cmp_fbconfig_cmpattr(ps, pfbc_a, pfbc_b, (attr)))) return -result; }
@@ -1150,33 +1463,38 @@ glx_gen_texture(session_t *ps, GLenum tex_tgt, int width, int height) {
 }
 
 static inline void
-glx_copy_region_to_tex(session_t *ps, GLenum tex_tgt, int basex, int basey,
-    int dx, int dy, int width, int height) {
-  if (width > 0 && height > 0)
-    glCopyTexSubImage2D(tex_tgt, 0, dx - basex, dy - basey,
-        dx, ps->root_height - dy - height, width, height);
+glx_copy_region_to_tex(session_t *ps, GLenum tex_tgt, int basex, int basey, int width, int height) {
+  if (width > 0 && height > 0) {
+    int dx = (basex < 0) ? 0 : basex;
+    basey = ps->root_height - (basey + height);
+    int dy = (basey < 0) ? 0 : basey;
+
+    width += basex;
+    width = (ps->root_width < width) ? ps->root_width - dx : width - dx;
+    height += basey;
+    height = (ps->root_height < height) ? ps->root_height - dy : height - dy;
+
+    glCopyTexSubImage2D(tex_tgt, 0, (basex < 0) ? 0 : dx, dy, dx, dy, width, height);
+  }
 }
 
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
 /**
- * Blur contents in a particular region.
+ * Blur contents in a particular region using the convolution blur.
  */
 bool
-glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
-    GLfloat factor_center,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg,
-    glx_blur_cache_t *pbc) {
+glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
+    double opacity,
+    XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
   assert(ps->psglx->blur_passes[0].prog);
   const bool more_passes = ps->psglx->blur_passes[1].prog;
   const bool have_scissors = glIsEnabled(GL_SCISSOR_TEST);
   const bool have_stencil = glIsEnabled(GL_STENCIL_TEST);
   bool ret = false;
 
-  // Calculate copy region size
-  glx_blur_cache_t ibc = { .width = 0, .height = 0 };
-  if (!pbc)
-    pbc = &ibc;
+  glx_blur_cache_t *pbc = &ps->psglx->blur_cache;
 
+  // Calculate copy region size
   int mdx = dx, mdy = dy, mwidth = width, mheight = height;
 #ifdef DEBUG_GLX
   printf_dbgf("(): %d, %d, %d, %d\n", mdx, mdy, mwidth, mheight);
@@ -1207,40 +1525,28 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
   if (ps->psglx->has_texture_non_power_of_two)
     tex_tgt = GL_TEXTURE_2D;
 
-  // Free textures if size inconsistency discovered
-  if (mwidth != pbc->width || mheight != pbc->height)
-    free_glx_bc_resize(ps, pbc);
-
-  // Generate FBO and textures if needed
-  if (!pbc->textures[0])
-    pbc->textures[0] = glx_gen_texture(ps, tex_tgt, mwidth, mheight);
+  // Check for FBO and textures if needed
   GLuint tex_scr = pbc->textures[0];
-  if (more_passes && !pbc->textures[1])
-    pbc->textures[1] = glx_gen_texture(ps, tex_tgt, mwidth, mheight);
-  pbc->width = mwidth;
-  pbc->height = mheight;
   GLuint tex_scr2 = pbc->textures[1];
 #ifdef CONFIG_VSYNC_OPENGL_FBO
-  if (more_passes && !pbc->fbo)
-    glGenFramebuffers(1, &pbc->fbo);
-  const GLuint fbo = pbc->fbo;
+  const GLuint fbo = pbc->fbos[0];
 #endif
 
   if (!tex_scr || (more_passes && !tex_scr2)) {
-    printf_errf("(): Failed to allocate texture.");
-    goto glx_blur_dst_end;
+    printf_errf("(): Blur cache texture not allocated.");
+    goto glx_conv_blur_dst_end;
   }
 #ifdef CONFIG_VSYNC_OPENGL_FBO
   if (more_passes && !fbo) {
-    printf_errf("(): Failed to allocate framebuffer.");
-    goto glx_blur_dst_end;
+    printf_errf("(): Blur cache framebuffer not allocated.");
+    goto glx_conv_blur_dst_end;
   }
 #endif
 
   // Read destination pixels into a texture
   glEnable(tex_tgt);
   glBindTexture(tex_tgt, tex_scr);
-  glx_copy_region_to_tex(ps, tex_tgt, mdx, mdy, mdx, mdy, mwidth, mheight);
+  glx_copy_region_to_tex(ps, tex_tgt, mdx, mdy, mwidth, mheight);
   /*
   if (tex_scr2) {
     glBindTexture(tex_tgt, tex_scr2);
@@ -1255,8 +1561,8 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
   // Texture scaling factor
   GLfloat texfac_x = 1.0f, texfac_y = 1.0f;
   if (GL_TEXTURE_2D == tex_tgt) {
-    texfac_x /= mwidth;
-    texfac_y /= mheight;
+    texfac_x /= pbc->width[0];
+    texfac_y /= pbc->height[0];
   }
 
   // Paint it back
@@ -1277,18 +1583,8 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
 #ifdef CONFIG_VSYNC_OPENGL_FBO
     if (!last_pass) {
-      static const GLenum DRAWBUFS[2] = { GL_COLOR_ATTACHMENT0 };
       glBindFramebuffer(GL_FRAMEBUFFER, fbo);
-      glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
-          GL_TEXTURE_2D, tex_scr2, 0);
-      glDrawBuffers(1, DRAWBUFS);
-      if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
-          != GL_FRAMEBUFFER_COMPLETE) {
-        printf_errf("(): Framebuffer attachment failed.");
-        goto glx_blur_dst_end;
-      }
-    }
-    else {
+    } else {
       static const GLenum DRAWBUFS[2] = { GL_BACK };
       glBindFramebuffer(GL_FRAMEBUFFER, 0);
       glDrawBuffers(1, DRAWBUFS);
@@ -1296,6 +1592,11 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
         glEnable(GL_SCISSOR_TEST);
       if (have_stencil)
         glEnable(GL_STENCIL_TEST);
+
+      if (opacity < 1.0) { // Blend blur texture to fade in and out with window opacity
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      }
     }
 #endif
 
@@ -1310,27 +1611,20 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
       glUniform1f(ppass->unifm_offset_x, texfac_x);
     if (ppass->unifm_offset_y >= 0)
       glUniform1f(ppass->unifm_offset_y, texfac_y);
-    if (ppass->unifm_factor_center >= 0)
-      glUniform1f(ppass->unifm_factor_center, factor_center);
+    if (ppass->unifm_opacity >= 0)
+      glUniform1f(ppass->unifm_opacity, (float)opacity);
 
     {
       P_PAINTREG_START();
       {
-        const GLfloat rx = (crect.x - mdx) * texfac_x;
-        const GLfloat ry = (mheight - (crect.y - mdy)) * texfac_y;
-        const GLfloat rxe = rx + crect.width * texfac_x;
-        const GLfloat rye = ry - crect.height * texfac_y;
-        GLfloat rdx = crect.x - mdx;
-        GLfloat rdy = mheight - crect.y + mdy;
+        GLfloat rdx = crect.x;
+        GLfloat rdy = ps->root_height - (crect.y + crect.height);
         GLfloat rdxe = rdx + crect.width;
-        GLfloat rdye = rdy - crect.height;
-
-        if (last_pass) {
-          rdx = crect.x;
-          rdy = ps->root_height - crect.y;
-          rdxe = rdx + crect.width;
-          rdye = rdy - crect.height;
-        }
+        GLfloat rdye = rdy + crect.height;
+        const GLfloat rx = rdx * texfac_x;
+        const GLfloat ry = rdy * texfac_y;
+        const GLfloat rxe = rx + crect.width * texfac_x;
+        const GLfloat rye = ry + crect.height * texfac_y;
 
 #ifdef DEBUG_GLX
         printf_dbgf("(): %f, %f, %f, %f -> %f, %f, %f, %f\n", rx, ry, rxe, rye, rdx, rdy, rdxe, rdye);
@@ -1363,7 +1657,7 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
   ret = true;
 
-glx_blur_dst_end:
+glx_conv_blur_dst_end:
 #ifdef CONFIG_VSYNC_OPENGL_FBO
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
 #endif
@@ -1374,8 +1668,257 @@ glx_blur_dst_end:
   if (have_stencil)
     glEnable(GL_STENCIL_TEST);
 
-  if (&ibc == pbc) {
-    free_glx_bc(ps, pbc);
+  glDisable(GL_BLEND);
+
+  glx_check_err(ps);
+
+  return ret;
+}
+
+/**
+ * Blur contents in a particular region using the dual-filter kawase blur.
+ */
+bool
+glx_dualkawase_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
+    double opacity,
+    XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
+  assert(ps->psglx->blur_passes[0].prog);
+  assert(ps->psglx->blur_passes[1].prog);
+  const bool have_scissors = glIsEnabled(GL_SCISSOR_TEST);
+  const bool have_stencil = glIsEnabled(GL_STENCIL_TEST);
+  bool ret = false;
+
+  int iterations = ps->o.blur_strength.iterations;
+  float offset = ps->o.blur_strength.offset;
+  int expand = ps->o.blur_strength.expand;
+
+  // Calculate copy region size
+  int mdx = dx - expand, mdy = dy - expand, mwidth = width + 2 * expand, mheight = height + 2 * expand;
+#ifdef DEBUG_GLX
+  printf_dbgf("(): %d, %d, %d, %d\n", mdx, mdy, mwidth, mheight);
+#endif
+
+  glx_blur_cache_t *psbc = &ps->psglx->blur_cache;
+
+  GLenum tex_tgt = GL_TEXTURE_RECTANGLE;
+  if (ps->psglx->has_texture_non_power_of_two)
+    tex_tgt = GL_TEXTURE_2D;
+
+  // Shrink blur_strength.iterations to still have at least 1px left
+  while ((width / (1 << (iterations-1))) < 1 || (height / (1 << (iterations-1))) < 1)
+    --iterations;
+  assert(iterations < MAX_BLUR_PASS);
+
+  // Check for FBO and textures
+  GLuint tex_scr = psbc->textures[0];
+  if (!tex_scr) {
+    printf_errf("(): Blur cache texture not allocated.");
+    goto glx_dualkawase_blur_dst_end;
+  }
+
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+  for (int i = 1; i <= iterations; i++) {
+    if (!psbc->textures[i]) {
+      printf_errf("(): Blur cache texture not allocated.");
+      goto glx_dualkawase_blur_dst_end;
+    }
+    if (!psbc->fbos[i - 1]) {
+      printf_errf("(): Blur cache framebuffer not allocated.");
+      goto glx_dualkawase_blur_dst_end;
+    }
+  }
+#endif
+
+  // Read destination pixels into a texture
+  glEnable(tex_tgt);
+  glBindTexture(tex_tgt, tex_scr);
+  glx_copy_region_to_tex(ps, tex_tgt, mdx, mdy, mwidth, mheight);
+
+  // Paint it back
+  glDisable(GL_STENCIL_TEST);
+  glDisable(GL_SCISSOR_TEST);
+
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+  // First pass: Kawase Downsample
+  const glx_blur_pass_t *down_pass = &ps->psglx->blur_passes[0];
+  for (int i = 1; i <= iterations; i++) {
+    const int dest_width = psbc->width[i], dest_height = psbc->height[i];
+    GLuint tex_src2 = psbc->textures[i - 1];
+    GLuint fbo = psbc->fbos[i - 1];
+
+    //assert(tex_src2);
+    //assert(fbo);
+    glBindTexture(tex_tgt, tex_src2);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glUseProgram(down_pass->prog);
+    if (down_pass->unifm_offset >= 0)
+        glUniform1f(down_pass->unifm_offset, offset);
+    if (down_pass->unifm_halfpixel >= 0)
+        glUniform2f(down_pass->unifm_halfpixel, 0.5 / dest_width, 0.5 / dest_height);
+    if (down_pass->unifm_fulltex >= 0)
+        glUniform2f(down_pass->unifm_fulltex, dest_width, dest_height);
+
+    // Start actual rendering
+    P_PAINTREG_START();
+    {
+      crect.x -= expand; crect.y -= expand;
+      crect.width += 2 * expand; crect.height += 2 * expand;
+
+      const GLfloat rx = crect.x;
+      const GLfloat ry = ps->root_height - crect.y;
+      const GLfloat rxe = rx + crect.width;
+      const GLfloat rye = ry - crect.height;
+      GLfloat rdx = rx / (1 << i);
+      GLfloat rdy = ry / (1 << i);
+      GLfloat rdxe = rxe / (1 << i);
+      GLfloat rdye = rye / (1 << i);
+
+#ifdef DEBUG_GLX
+      printf_dbgf("(): Downsample Pass %d: %f, %f, %f, %f -> %f, %f, %f, %f\n", i, rx, ry, rxe, rye, rdx, rdy, rdxe, rdye);
+#endif
+
+      glTexCoord2f(rx, ry);
+      glVertex3f(rdx, rdy, z);
+
+      glTexCoord2f(rxe, ry);
+      glVertex3f(rdxe, rdy, z);
+
+      glTexCoord2f(rxe, rye);
+      glVertex3f(rdxe, rdye, z);
+
+      glTexCoord2f(rx, rye);
+      glVertex3f(rdx, rdye, z);
+    }
+    P_PAINTREG_END();
+  }
+#endif
+
+  // Second pass: Kawase Upsample
+  const glx_blur_pass_t *up_pass = &ps->psglx->blur_passes[1];
+  for (int i = iterations; i >= 1; i--) {
+    const int dest_width = psbc->width[i - 1], dest_height = psbc->height[i - 1];
+    GLuint tex_src2 = psbc->textures[i];
+    //assert(tex_src2);
+    glBindTexture(tex_tgt, tex_src2);
+
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+    if (i != 1) { // is not last pass
+      GLuint fbo = psbc->fbos[i - 2];
+      //assert(fbo);
+      glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    } else { // last pass -> render to screen
+      static const GLenum DRAWBUFS[2] = { GL_BACK };
+      glBindFramebuffer(GL_FRAMEBUFFER, 0);
+      glDrawBuffers(1, DRAWBUFS);
+      if (have_scissors)
+        glEnable(GL_SCISSOR_TEST);
+      if (have_stencil)
+        glEnable(GL_STENCIL_TEST);
+
+      if (opacity < 1.0) { // Blend blur texture to fade in and out with window opacity
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+      }
+    }
+#endif
+
+    glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    glUseProgram(up_pass->prog);
+    if (up_pass->unifm_offset >= 0)
+        glUniform1f(up_pass->unifm_offset, offset);
+    if (up_pass->unifm_opacity >= 0)
+        glUniform1f(up_pass->unifm_opacity, (float)opacity);
+    if (up_pass->unifm_halfpixel >= 0)
+        glUniform2f(up_pass->unifm_halfpixel, 0.5 / dest_width, 0.5 / dest_height);
+    if (up_pass->unifm_fulltex >= 0)
+        glUniform2f(up_pass->unifm_fulltex, dest_width, dest_height);
+
+    // Start actual rendering
+    P_PAINTREG_START();
+    {
+      const GLfloat rx = crect.x - expand;
+      const GLfloat ry = ps->root_height - (crect.y + crect.height) - expand;
+      const GLfloat rxe = rx + crect.width + 2 * expand;
+      const GLfloat rye = ry + crect.height + 2 * expand;
+      GLfloat rdx;
+      GLfloat rdy;
+      GLfloat rdxe;
+      GLfloat rdye;
+
+      if (i != 1) { // is not last pass
+        rdx = rx / (1 << (i-1));
+        rdy = ry / (1 << (i-1));
+        rdxe = rxe / (1 << (i-1));
+        rdye = rye / (1 << (i-1));
+      } else { // last pass -> render to screen coordinates
+        rdx = crect.x;
+        rdy = ps->root_height - (crect.y + crect.height);
+        rdxe = rdx + crect.width;
+        rdye = rdy + crect.height;
+      }
+
+#ifdef DEBUG_GLX
+      printf_dbgf("(): Upsample Pass %d: %f, %f, %f, %f -> %f, %f, %f, %f\n", i, rx, ry, rxe, rye, rdx, rdy, rdxe, rdye);
+#endif
+
+      glTexCoord2f(rx, ry);
+      glVertex3f(rdx, rdy, z);
+
+      glTexCoord2f(rxe, ry);
+      glVertex3f(rdxe, rdy, z);
+
+      glTexCoord2f(rxe, rye);
+      glVertex3f(rdxe, rdye, z);
+
+      glTexCoord2f(rx, rye);
+      glVertex3f(rdx, rdye, z);
+    }
+    P_PAINTREG_END();
+  }
+
+  glUseProgram(0);
+  ret = true;
+
+glx_dualkawase_blur_dst_end:
+#ifdef CONFIG_VSYNC_OPENGL_FBO
+  glBindFramebuffer(GL_FRAMEBUFFER, 0);
+#endif
+  glBindTexture(tex_tgt, 0);
+  glDisable(tex_tgt);
+  if (have_scissors)
+    glEnable(GL_SCISSOR_TEST);
+  if (have_stencil)
+    glEnable(GL_STENCIL_TEST);
+
+  glDisable(GL_BLEND);
+
+  return ret;
+}
+
+/**
+ * Blur contents in a particular region using the selected blur algorithm.
+ */
+bool
+glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
+    double opacity,
+    XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
+  assert(ps->psglx->blur_passes[0].prog);
+
+  bool ret;
+  switch (ps->o.blur_method) {
+    case BLRMTHD_CONV:
+      ret = glx_conv_blur_dst(ps, dx, dy, width, height, z,
+        opacity, reg_tgt, pcache_reg);
+      break;
+    case BLRMTHD_DUALKAWASE:
+      ret = glx_dualkawase_blur_dst(ps, dx, dy, width, height, z,
+        opacity, reg_tgt, pcache_reg);
+      break;
+    default:
+      ret = false;
+      break;
   }
 
   glx_check_err(ps);
@@ -1650,8 +2193,10 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
 
 /**
  * Render a region with color.
+ *
+ * Unused but can be useful for debugging
  */
-static void
+static void __attribute__((unused))
 glx_render_color(session_t *ps, int dx, int dy, int width, int height, int z,
     XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
   static int color = 0;
@@ -1686,8 +2231,10 @@ glx_render_color(session_t *ps, int dx, int dy, int width, int height, int z,
 
 /**
  * Render a region with dots.
+ *
+ * Unused but can be useful for debugging
  */
-static void
+static void __attribute__((unused))
 glx_render_dots(session_t *ps, int dx, int dy, int width, int height, int z,
     XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
   glColor4f(0.0f, 0.0f, 0.0f, 1.0f);

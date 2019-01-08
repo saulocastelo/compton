@@ -229,7 +229,7 @@
 #define CGLX_MAX_BUFFER_AGE 5
 
 /// @brief Maximum passes for blur.
-#define MAX_BLUR_PASS 5
+#define MAX_BLUR_PASS 6
 
 // Window flags
 
@@ -352,6 +352,13 @@ typedef enum {
   NUM_VSYNC,
 } vsync_t;
 
+/// Possible background blur algorithms.
+enum blur_method {
+    BLRMTHD_CONV,
+    BLRMTHD_DUALKAWASE,
+    NUM_BLRMTHD,
+};
+
 /// @brief Possible backends of compton.
 enum backend {
   BKEND_XRENDER,
@@ -449,7 +456,7 @@ typedef struct {
   bool y_inverted;
 } glx_fbconfig_t;
 
-/// @brief Wrapper of a binded GLX texture.
+/// @brief Wrapper of a bound GLX texture.
 struct _glx_texture {
   GLuint texture;
   GLXPixmap glpixmap;
@@ -467,23 +474,29 @@ typedef struct {
   GLuint frag_shader;
   /// GLSL program for blur.
   GLuint prog;
-  /// Location of uniform "offset_x" in blur GLSL program.
+  /// Location of uniform "offset_x" in conv-blur GLSL program.
   GLint unifm_offset_x;
-  /// Location of uniform "offset_y" in blur GLSL program.
+  /// Location of uniform "offset_y" in conv-blur GLSL program.
   GLint unifm_offset_y;
-  /// Location of uniform "factor_center" in blur GLSL program.
-  GLint unifm_factor_center;
+  /// Location of uniform "opacity" in conv-blur and (dual filter) kawase-blur GLSL program.
+  GLint unifm_opacity;
+  /// Location of uniform "offset" in (dual filter) kawase-blur GLSL program.
+  GLint unifm_offset;
+  /// Location of uniform "halfpixel" in (dual filter) kawase-blur GLSL program.
+  GLint unifm_halfpixel;
+  /// Location of uniform "fulltex" in (dual filter) kawase-blur GLSL program.
+  GLint unifm_fulltex;
 } glx_blur_pass_t;
 
 typedef struct {
   /// Framebuffer used for blurring.
-  GLuint fbo;
+  GLuint fbos[MAX_BLUR_PASS];
   /// Textures used for blurring.
-  GLuint textures[2];
+  GLuint textures[MAX_BLUR_PASS];
   /// Width of the textures.
-  int width;
+  int width[MAX_BLUR_PASS];
   /// Height of the textures.
-  int height;
+  int height[MAX_BLUR_PASS];
 } glx_blur_cache_t;
 
 typedef struct {
@@ -537,6 +550,12 @@ typedef struct {
 struct _timeout_t;
 
 struct _win;
+
+typedef struct {
+  int iterations;
+  float offset;
+  int expand;
+} blur_strength_t;
 
 typedef struct _c2_lptr c2_lptr_t;
 
@@ -707,8 +726,12 @@ typedef struct _options_t {
   bool blur_background_fixed;
   /// Background blur blacklist. A linked list of conditions.
   c2_lptr_t *blur_background_blacklist;
+  /// Blur method.
+  enum blur_method blur_method;
   /// Blur convolution kernel.
   XFixed *blur_kerns[MAX_BLUR_PASS];
+  /// Blur strength.
+  blur_strength_t blur_strength;
   /// How much to dim an inactive window. 0.0 - 1.0, 0 to disable.
   double inactive_dim;
   /// Whether to use fixed inactive dim opacity, instead of deciding
@@ -795,6 +818,9 @@ typedef struct {
   /// FBConfig-s for GLX pixmap of different depths.
   glx_fbconfig_t *fbconfigs[OPENGL_MAX_DEPTH + 1];
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
+  /// Cached blur textures for every pass
+  glx_blur_cache_t blur_cache;
+  /// Blur shader for every pass
   glx_blur_pass_t blur_passes[MAX_BLUR_PASS];
 #endif
 } glx_session_t;
@@ -1227,11 +1253,6 @@ typedef struct _win {
   bool blur_background;
   /// Background state on last paint.
   bool blur_background_last;
-
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-  /// Textures and FBO background blur use.
-  glx_blur_cache_t glx_blur_cache;
-#endif
 } win;
 
 /// Temporary structure used for communication between
@@ -1263,6 +1284,7 @@ typedef enum {
 extern const char * const WINTYPES[NUM_WINTYPES];
 extern const char * const VSYNC_STRS[NUM_VSYNC + 1];
 extern const char * const BACKEND_STRS[NUM_BKEND + 1];
+extern const char * const BLUR_METHOD_STRS[NUM_BLRMTHD + 1];
 extern session_t *ps_g;
 
 // == Debugging code ==
@@ -1666,6 +1688,58 @@ parse_vsync(session_t *ps, const char *str) {
 
   printf_errf("(\"%s\"): Invalid vsync argument.", str);
   return false;
+}
+
+/**
+ * Parse a blur_method option argument.
+ */
+static inline bool
+parse_blur_method(session_t *ps, const char *str) {
+  for (enum blur_method i = 0; BLUR_METHOD_STRS[i]; ++i)
+    if (!strcasecmp(str, BLUR_METHOD_STRS[i])) {
+      ps->o.blur_method = i;
+      return true;
+    }
+
+  printf_errf("(\"%s\"): Invalid blur_method argument.", str);
+  return false;
+}
+
+/**
+ * Parse a blur_strength option argument.
+ */
+static inline bool
+parse_blur_strength(session_t *ps, const int level) {
+  static const blur_strength_t values[20] = {
+    { .iterations = 1, .offset =  1.5    , .expand = 10 }, // 1
+    { .iterations = 1, .offset =  2.0    , .expand = 10 }, // 2
+    { .iterations = 2, .offset =  2.5    , .expand = 20 }, // 3
+    { .iterations = 2, .offset =  3.0    , .expand = 20 }, // 4
+    { .iterations = 3, .offset =  2.75   , .expand = 50 }, // 5
+    { .iterations = 3, .offset =  3.5    , .expand = 50 }, // 6
+    { .iterations = 3, .offset =  4.25   , .expand = 50 }, // 7
+    { .iterations = 3, .offset =  5.0    , .expand = 50 }, // 8
+    { .iterations = 4, .offset =  3.71429, .expand = 150 }, // 9
+    { .iterations = 4, .offset =  4.42857, .expand = 150 }, // 10
+    { .iterations = 4, .offset =  5.14286, .expand = 150 }, // 11
+    { .iterations = 4, .offset =  5.85714, .expand = 150 }, // 12
+    { .iterations = 4, .offset =  6.57143, .expand = 150 }, // 13
+    { .iterations = 4, .offset =  7.28571, .expand = 150 }, // 14
+    { .iterations = 4, .offset =  8.0    , .expand = 150 }, // 15
+    { .iterations = 5, .offset =  6.0    , .expand = 400 }, // 16
+    { .iterations = 5, .offset =  7.0    , .expand = 400 }, // 17
+    { .iterations = 5, .offset =  8.0    , .expand = 400 }, // 18
+    { .iterations = 5, .offset =  9.0    , .expand = 400 }, // 19
+    { .iterations = 5, .offset = 10.0    , .expand = 400 }, // 20
+  };
+
+  if (level < 1 || level > 20) {
+    printf_errf("(\"%d\"): Invalid blur_strength argument. Needs to be a number between 1 and 20.", level);
+    return false;
+  }
+
+  ps->o.blur_strength = values[level - 1];
+  return true;
 }
 
 /**
@@ -2197,9 +2271,8 @@ glx_set_clip(session_t *ps, XserverRegion reg, const reg_data_t *pcache_reg);
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
 bool
 glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
-    GLfloat factor_center,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg,
-    glx_blur_cache_t *pbc);
+    double opacity,
+    XserverRegion reg_tgt, const reg_data_t *pcache_reg);
 #endif
 
 bool
@@ -2276,10 +2349,11 @@ free_glx_fbo(session_t *ps, GLuint *pfbo) {
  */
 static inline void
 free_glx_bc_resize(session_t *ps, glx_blur_cache_t *pbc) {
-  free_texture_r(ps, &pbc->textures[0]);
-  free_texture_r(ps, &pbc->textures[1]);
-  pbc->width = 0;
-  pbc->height = 0;
+  for (int i = 0; i < MAX_BLUR_PASS; i++) {
+    free_texture_r(ps, &pbc->textures[i]);
+    pbc->width[i] = 0;
+    pbc->height[i] = 0;
+  }
 }
 
 /**
@@ -2287,7 +2361,8 @@ free_glx_bc_resize(session_t *ps, glx_blur_cache_t *pbc) {
  */
 static inline void
 free_glx_bc(session_t *ps, glx_blur_cache_t *pbc) {
-  free_glx_fbo(ps, &pbc->fbo);
+  for (int i = 0; i < MAX_BLUR_PASS; i++)
+    free_glx_fbo(ps, &pbc->fbos[i]);
   free_glx_bc_resize(ps, pbc);
 }
 #endif
@@ -2331,9 +2406,6 @@ static inline void
 free_win_res_glx(session_t *ps, win *w) {
   free_paint_glx(ps, &w->paint);
   free_paint_glx(ps, &w->shadow_paint);
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-  free_glx_bc(ps, &w->glx_blur_cache);
-#endif
 }
 
 /**
@@ -2402,7 +2474,7 @@ xr_sync_(session_t *ps, Drawable d
     if (!*pfence)
       *pfence = XSyncCreateFence(ps->dpy, d, False);
     if (*pfence) {
-      Bool triggered = False;
+      Bool __attribute__((unused)) triggered = False;
       /* if (XSyncQueryFence(ps->dpy, *pfence, &triggered) && triggered)
         XSyncResetFence(ps->dpy, *pfence); */
       // The fence may fail to be created (e.g. because of died drawable)

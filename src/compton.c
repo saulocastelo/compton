@@ -43,6 +43,13 @@ const char * const VSYNC_STRS[NUM_VSYNC + 1] = {
   NULL
 };
 
+/// Names of blur_methods.
+const char * const BLUR_METHOD_STRS[NUM_BLRMTHD + 1] = {
+    "convolution",    // BLRMTHD_CONV
+    "dual_kawase",    // BLRMTHD_DUALKAWASE
+    NULL
+};
+
 /// Names of backends.
 const char * const BACKEND_STRS[NUM_BKEND + 1] = {
   "xrender",      // BKEND_XRENDER
@@ -1436,10 +1443,12 @@ win_blur_background(session_t *ps, win *w, Picture tgt_buffer,
   const int hei = w->heightb;
 
   double factor_center = 1.0;
+  double opacity = 1.0;
   // Adjust blur strength according to window opacity, to make it appear
   // better during fading
   if (!ps->o.blur_background_fixed) {
-    double pct = 1.0 - get_opacity_percent(w) * (1.0 - 1.0 / 9.0);
+    opacity = get_opacity_percent(w);
+    double pct = 1.0 - opacity * (1.0 - 1.0 / 9.0);
     factor_center = pct * 8.0 / (1.1 - pct);
   }
 
@@ -1502,8 +1511,8 @@ win_blur_background(session_t *ps, win *w, Picture tgt_buffer,
 #ifdef CONFIG_VSYNC_OPENGL_GLSL
     case BKEND_GLX:
       // TODO: Handle frame opacity
-      glx_blur_dst(ps, x, y, wid, hei, ps->psglx->z - 0.5, factor_center,
-          reg_paint, pcache_reg, &w->glx_blur_cache);
+      glx_blur_dst(ps, x, y, wid, hei, ps->psglx->z - 0.5, opacity,
+          reg_paint, pcache_reg);
       break;
 #endif
     default:
@@ -1722,6 +1731,8 @@ win_paint_win(session_t *ps, win *w, XserverRegion reg_paint,
             reg_paint, pcache_reg);
         break;
 #endif
+      default:
+        assert(false);
     }
   }
 
@@ -2277,6 +2288,8 @@ static void
 unmap_win(session_t *ps, win *w) {
   if (!w || IsUnmapped == w->a.map_state) return;
 
+  if (w->destroyed) return;
+
   // One last synchronization
   if (w->paint.pixmap)
     xr_sync(ps, w->paint.pixmap, &w->fence);
@@ -2662,29 +2675,6 @@ win_on_factor_change(session_t *ps, win *w) {
   if (IsViewable == w->a.map_state && ps->o.unredir_if_possible_blacklist)
     w->unredir_if_possible_excluded = win_match(ps, w,
         ps->o.unredir_if_possible_blacklist, &w->cache_uipblst);
-}
-
-/**
- * Process needed window updates.
- */
-static void
-win_upd_run(session_t *ps, win *w, win_upd_t *pupd) {
-  if (pupd->shadow) {
-    win_determine_shadow(ps, w);
-    pupd->shadow = false;
-  }
-  if (pupd->fade) {
-    win_determine_fade(ps, w);
-    pupd->fade = false;
-  }
-  if (pupd->invert_color) {
-    win_determine_invert_color(ps, w);
-    pupd->invert_color = false;
-  }
-  if (pupd->focus) {
-    win_update_focused(ps, w);
-    pupd->focus = false;
-  }
 }
 
 /**
@@ -3204,17 +3194,18 @@ circulate_win(session_t *ps, XCirculateEvent *ce) {
 }
 
 static void
-finish_destroy_win(session_t *ps, Window id) {
-  win **prev = NULL, *w = NULL;
+finish_destroy_win(session_t *ps, win *w) {
+  assert(w->destroyed);
+  win **prev = NULL, *i = NULL;
 
 #ifdef DEBUG_EVENTS
-  printf_dbgf("(%#010lx): Starting...\n", id);
+  printf_dbgf("(%#010lx): Starting...\n", w->id);
 #endif
 
-  for (prev = &ps->list; (w = *prev); prev = &w->next) {
-    if (w->id == id && w->destroyed) {
+  for (prev = &ps->list; (i = *prev); prev = &i->next) {
+    if (w == i) {
 #ifdef DEBUG_EVENTS
-      printf_dbgf("(%#010lx \"%s\"): %p\n", id, w->name, w);
+      printf_dbgf("(%#010lx \"%s\"): %p\n", w->id, w->name, w);
 #endif
 
       finish_unmap_win(ps, w);
@@ -3240,7 +3231,7 @@ finish_destroy_win(session_t *ps, Window id) {
 
 static void
 destroy_callback(session_t *ps, win *w) {
-  finish_destroy_win(ps, w->id);
+  finish_destroy_win(ps, w);
 }
 
 static void
@@ -3320,7 +3311,8 @@ xerror(Display __attribute__((unused)) *dpy, XErrorEvent *ev) {
 
   if (ev->request_code == ps->composite_opcode
       && ev->minor_code == X_CompositeRedirectSubwindows) {
-    fprintf(stderr, "Another composite manager is already running\n");
+    fprintf(stderr, "Another composite manager is already running "
+        "(and does not handle _NET_WM_CM_Sn correctly)\n");
     exit(1);
   }
 
@@ -3440,8 +3432,6 @@ wid_get_prop_window(session_t *ps, Window wid, Atom aprop) {
  */
 static void
 win_update_focused(session_t *ps, win *w) {
-  bool focused_old = w->focused;
-
   if (UNSET != w->focused_force) {
     w->focused = w->focused_force;
   }
@@ -4348,6 +4338,16 @@ ev_screen_change_notify(session_t *ps,
   }
 }
 
+inline static void
+ev_selection_clear(session_t *ps,
+    XSelectionClearEvent __attribute__((unused)) *ev) {
+  // The only selection we own is the _NET_WM_CM_Sn selection.
+  // If we lose that one, we should exit.
+  fprintf(stderr, "Another composite manager started and "
+      "took the _NET_WM_CM_Sn selection.\n");
+  exit(1);
+}
+
 #if defined(DEBUG_EVENTS) || defined(DEBUG_RESTACK)
 /**
  * Get a window's name from window ID.
@@ -4439,6 +4439,9 @@ ev_handle(session_t *ps, XEvent *ev) {
       break;
     case PropertyNotify:
       ev_property_notify(ps, (XPropertyEvent *)ev);
+      break;
+    case SelectionClear:
+      ev_selection_clear(ps, (XSelectionClearEvent *)ev);
       break;
     default:
       if (ps->shape_exists && ev->type == ps->shape_event) {
@@ -4699,7 +4702,16 @@ usage(int ret) {
     "  Use fixed blur strength instead of adjusting according to window\n"
     "  opacity.\n"
     "\n"
+    "--blur-method algorithm\n"
+    "  Specify the algorithm for background blur. It is either one of:\n"
+    "    convolution (default), dual_kawase\n"
+    "\n"
+    "--blur-strength level\n"
+    "  Only valid for '--blur-method dual_kawase'!\n"
+    "  The strength of the dual_kawase blur as an integer between 1 and 20. Defaults to 5.\n"
+    "\n"
     "--blur-kern matrix\n"
+    "  Only valid for '--blur-method convolution'!\n"
     "  Specify the blur convolution kernel, with the following format:\n"
     "    WIDTH,HEIGHT,ELE1,ELE2,ELE3,ELE4,ELE5...\n"
     "  The element in the center must not be included, it will be forever\n"
@@ -4892,6 +4904,7 @@ register_cm(session_t *ps) {
   if (!ps->o.no_x_selection) {
     unsigned len = strlen(REGISTER_PROP) + 2;
     int s = ps->scr;
+    Atom atom;
 
     while (s >= 10) {
       ++len;
@@ -4901,7 +4914,13 @@ register_cm(session_t *ps) {
     char *buf = malloc(len);
     snprintf(buf, len, REGISTER_PROP "%d", ps->scr);
     buf[len - 1] = '\0';
-    XSetSelectionOwner(ps->dpy, get_atom(ps, buf), ps->reg_win, 0);
+    atom = get_atom(ps, buf);
+
+    if (XGetSelectionOwner(ps->dpy, atom) != None) {
+      fprintf(stderr, "Another composite manager is already running\n");
+      return false;
+    }
+    XSetSelectionOwner(ps->dpy, atom, ps->reg_win, 0);
     free(buf);
   }
 
@@ -5040,7 +5059,7 @@ parse_matrix(session_t *ps, const char *src, const char **endptr) {
   int wid = 0, hei = 0;
   const char *pc = NULL;
   XFixed *matrix = NULL;
-  
+
   // Get matrix width and height
   {
     double val = 0.0;
@@ -5063,10 +5082,9 @@ parse_matrix(session_t *ps, const char *src, const char **endptr) {
     printf_errf("(): Width/height not odd.");
     goto parse_matrix_err;
   }
-  if (wid > 16 || hei > 16) {
-    printf_errf("(): Matrix width/height too large.");
-    goto parse_matrix_err;
-  }
+  if (wid > 16 || hei > 16)
+    printf_errf("(): Matrix width/height too large, may slow down"
+                "rendering, and/or consume lots of memory");
 
   // Allocate memory
   matrix = calloc(wid * hei + 2, sizeof(XFixed));
@@ -5618,6 +5636,14 @@ parse_config(session_t *ps, struct options_tmp *pcfgtmp) {
   // --blur-background-fixed
   lcfg_lookup_bool(&cfg, "blur-background-fixed",
       &ps->o.blur_background_fixed);
+  // --blur-method
+  if (config_lookup_string(&cfg, "blur-method", &sval)
+      && !parse_blur_method(ps, sval))
+    exit(1);
+  // --blur-strength
+  if (lcfg_lookup_int(&cfg, "blur-strength", &ival)
+      && !parse_blur_strength(ps, ival))
+    exit(1);
   // --blur-kern
   if (config_lookup_string(&cfg, "blur-kern", &sval)
       && !parse_conv_kern_lst(ps, sval, ps->o.blur_kerns, MAX_BLUR_PASS))
@@ -5756,6 +5782,8 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
     { "version", no_argument, NULL, 318 },
     { "no-x-selection", no_argument, NULL, 319 },
     { "no-name-pixmap", no_argument, NULL, 320 },
+    { "blur-method", required_argument, NULL, 321 },
+    { "blur-strength", required_argument, NULL, 322 },
     { "reredir-on-root-change", no_argument, NULL, 731 },
     { "glx-reinit-on-root-change", no_argument, NULL, 732 },
     // Must terminate with a NULL entry
@@ -6027,6 +6055,16 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
         ps->o.glx_fshader_win_str = mstrcpy(optarg);
         break;
       P_CASEBOOL(319, no_x_selection);
+      case 321:
+        // --blur-method
+        if (!parse_blur_method(ps, optarg))
+          exit(1);
+        break;
+      case 322:
+        // --blur-strength
+        if (!parse_blur_strength(ps, strtol(optarg, NULL, 0)))
+          exit(1);
+        break;
       P_CASEBOOL(731, reredir_on_root_change);
       P_CASEBOOL(732, glx_reinit_on_root_change);
       default:
@@ -6091,8 +6129,14 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
     ps->o.track_leader = true;
   }
 
+  // Blur method dual_kawase is not compatible with the xrender backend
+  if (ps->o.backend != BKEND_GLX && ps->o.blur_method == BLRMTHD_DUALKAWASE) {
+      printf_errf("(): Blur method 'dual_kawase' is incompatible with the XRender backend. Fall back to default.\n");
+      ps->o.blur_method = BLRMTHD_CONV;
+  }
+
   // Fill default blur kernel
-  if (ps->o.blur_background && !ps->o.blur_kerns[0]) {
+  if (ps->o.blur_background && (BLRMTHD_CONV == ps->o.blur_method) && !ps->o.blur_kerns[0]) {
     // Convolution filter parameter (box blur)
     // gaussian or binomial filters are definitely superior, yet looks
     // like they aren't supported as of xorg-server-1.13.0
@@ -6597,8 +6641,11 @@ init_filters(session_t *ps) {
         {
           if (!glx_init_blur(ps))
             return false;
+          break;
         }
 #endif
+      default:
+        assert(false);
     }
   }
 
@@ -7031,7 +7078,9 @@ session_init(session_t *ps_old, int argc, char **argv) {
       .blur_background_frame = false,
       .blur_background_fixed = false,
       .blur_background_blacklist = NULL,
+      .blur_method = BLRMTHD_CONV,
       .blur_kerns = { NULL },
+      .blur_strength = { .iterations = 3, .offset = 2.75, .expand = 50 },
       .inactive_dim = 0.0,
       .inactive_dim_fixed = false,
       .invert_color_list = NULL,

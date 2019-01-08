@@ -733,6 +733,8 @@ set_tgt_clip(session_t *ps, XserverRegion reg, const reg_data_t *pcache_reg) {
       glx_set_clip(ps, reg, pcache_reg);
       break;
 #endif
+    default:
+      assert(false);
   }
 }
 
@@ -886,9 +888,6 @@ static void
 win_on_factor_change(session_t *ps, win *w);
 
 static void
-win_upd_run(session_t *ps, win *w, win_upd_t *pupd);
-
-static void
 calc_win_size(session_t *ps, win *w);
 
 static void
@@ -919,7 +918,7 @@ static void
 circulate_win(session_t *ps, XCirculateEvent *ce);
 
 static void
-finish_destroy_win(session_t *ps, Window id);
+finish_destroy_win(session_t *ps, win *w);
 
 static void
 destroy_callback(session_t *ps, win *w);
