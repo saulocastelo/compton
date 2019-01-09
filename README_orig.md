@@ -4,10 +4,6 @@
 
 __Compton__ is a compositor for X, and a fork of __xcompmgr-dana__.
 
-This branch includes a new blur method: The multi-pass **dual kawase blur**!
-Use it with the `--blur-method kawase` and `--blur-strength LEVEL` options.
-Only works with the `glx` backend!
-
 I was frustrated by the low amount of standalone lightweight compositors.
 Compton was forked from Dana Jansens' fork of xcompmgr and refactored.  I fixed
 whatever bug I found, and added features I wanted. Things seem stable, but don't
@@ -67,70 +63,61 @@ __R__ for runtime
 * libdbus (B,R) (Can be disabled with `NO_DBUS` at compile time)
 * asciidoc (B) (and docbook-xml-dtd-4.5, libxml-utils, libxslt, xsltproc, xmlto, etc. if your distro doesn't pull them in)
 
-**This is a development branch, bug to be expected**
-
-This is forked from the original Compton because that seems to have become unmaintained.
-
-The current battle plan of this fork is to refactor it to make the code _possible_ to maintain, so potential contributors won't be scared away when they take a look at the code.
-
-We also try to fix bugs.
-
-The original README can be found [here](README_orig.md)
-
-## Changelog
-
-See [Releases](https://github.com/yshui/compton/releases)
-
-## Build
-
-### Dependencies
-
-Assuming you already have all the usual building tools installed (e.g. gcc, meson, ninja, etc.), you still need:
-
-* libx11
-* libx11-xcb
-* libXext
-* xproto
-* xcb
-* xcb-damage
-* xcb-xfixes
-* xcb-shape
-* xcb-renderutil
-* xcb-render
-* xcb-randr
-* xcb-composite
-* xcb-image
-* xcb-present
-* xcb-xinerama (optional, disable with the `-Dxinerama=false` meson configure flag)
-* pixman
-* libdbus (optional, disable with the `-Ddbus=false` meson configure flag)
-* libconfig (optional, disable with the `-Dconfig_file=false` meson configure flag)
-* libxdg-basedir (optional, disable with the `-Dconfig_file=false` meson configure flag)
-* libGL (optional, disable with the `-Dopengl=false` meson configure flag)
-* libpcre (optional, disable with the `-Dregex=false` meson configure flag)
-* libev
-
-To build the documents, you need `asciidoc`
-
 ### How to build
 
+To build, make sure you have the dependencies above:
+
 ```bash
-$ meson --buildtype=release . build
-$ ninja -C build
+# Make the main program
+$ make
+# Make the man pages
+$ make docs
+# Install
+$ make install
 ```
 
-Built binary can be found in `build/src`
+(Compton does include a `_CMakeLists.txt` in the tree, but we haven't decided whether we should switch to CMake yet. The `Makefile` is fully usable right now.)
 
-## How to Contribute
+## Known issues
 
-### Code
+* Our [FAQ](https://github.com/chjj/compton/wiki/faq) covers some known issues.
 
-You can look at the [Projects](https://github.com/yshui/compton/projects) page, and see if there is anything interests you. Or you can take a look at the [Issues](https://github.com/yshui/compton/issues).
+* VSync does not work too well. You may check the [VSync Guide](https://github.com/chjj/compton/wiki/vsync-guide) for how to get (possibly) better effects.
 
-### Non-code
+* If `--unredir-if-possible` is enabled, when compton redirects/unredirects windows, the screen may flicker. Using `--paint-on-overlay` minimizes the problem from my observation, yet I do not know if there's a cure.
 
-Even if you don't want to contribute code, you can still contribute by compiling and running this branch, and report any issue you can find.
+* compton may not track focus correctly in all situations. The focus tracking code is experimental. `--use-ewmh-active-win` might be helpful.
 
-## Contributors
+* The performance of blur under X Render backend might be pretty bad. OpenGL backend could be faster.
 
-See [CONTRIBUTORS](CONTRIBUTORS)
+* With `--blur-background` you may sometimes see weird lines around damaged area. `--resize-damage YOUR_BLUR_RADIUS` might be helpful in the case.
+
+## Usage
+
+Please refer to the Asciidoc man pages (`man/compton.1.asciidoc` & `man/compton-trans.1.asciidoc`) for more details and examples.
+
+Note a sample configuration file `compton.sample.conf` is included in the repository.
+
+## Support
+
+* Bug reports and feature requests should go to the "Issues" section above.
+
+* Our (semi?) official IRC channel is #compton on FreeNode.
+
+* Some information is available on the wiki, including [FAQ](https://github.com/chjj/compton/wiki/faq), [VSync Guide](https://github.com/chjj/compton/wiki/vsync-guide), and [Performance Guide](https://github.com/chjj/compton/wiki/perf-guide).
+
+## License
+
+Although compton has kind of taken on a life of its own, it was originally
+an xcompmgr fork. xcompmgr has gotten around. As far as I can tell, the lineage
+for this particular tree is something like:
+
+* Keith Packard (original author)
+* Matthew Hawn
+* ...
+* Dana Jansens
+* chjj and richardgv
+
+Not counting the tens of people who forked it in between.
+
+Compton is distributed under MIT license, as far as I (richardgv) know. See LICENSE for more info.

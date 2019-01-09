@@ -1,34 +1,193 @@
+// SPDX-License-Identifier: MIT
 /*
  * Compton - a compositor for X11
  *
  * Based on `xcompmgr` - Copyright (c) 2003, Keith Packard
  *
  * Copyright (c) 2011-2013, Christopher Jeffrey
- * See LICENSE for more information.
+ * See LICENSE-mit for more information.
  *
  */
 
+#include "compiler.h"
+#include "string_utils.h"
+#include "log.h"
+
 #include "opengl.h"
 
-#ifdef CONFIG_GLX_SYNC
-void
-xr_glx_sync(session_t *ps, Drawable d, XSyncFence *pfence) {
-  if (*pfence) {
-    // GLsync sync = ps->psglx->glFenceSyncProc(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-    GLsync sync = ps->psglx->glImportSyncEXT(GL_SYNC_X11_FENCE_EXT, *pfence, 0);
-    /* GLenum ret = ps->psglx->glClientWaitSyncProc(sync, GL_SYNC_FLUSH_COMMANDS_BIT,
-        1000);
-    assert(GL_CONDITION_SATISFIED == ret); */
-    XSyncTriggerFence(ps->dpy, *pfence);
-    XFlush(ps->dpy);
-    ps->psglx->glWaitSyncProc(sync, 0, GL_TIMEOUT_IGNORED);
-    // ps->psglx->glDeleteSyncProc(sync);
-    // XSyncResetFence(ps->dpy, *pfence);
-  }
-  glx_check_err(ps);
+static inline int
+glx_cmp_fbconfig_cmpattr(session_t *ps,
+    const glx_fbconfig_t *pfbc_a, const glx_fbconfig_t *pfbc_b,
+    int attr) {
+  int attr_a = 0, attr_b = 0;
+
+  // TODO: Error checking
+  glXGetFBConfigAttrib(ps->dpy, pfbc_a->cfg, attr, &attr_a);
+  glXGetFBConfigAttrib(ps->dpy, pfbc_b->cfg, attr, &attr_b);
+
+  return attr_a - attr_b;
 }
+
+/**
+ * Compare two GLX FBConfig's to find the preferred one.
+ */
+static int
+glx_cmp_fbconfig(session_t *ps,
+    const glx_fbconfig_t *pfbc_a, const glx_fbconfig_t *pfbc_b) {
+  int result = 0;
+
+  if (!pfbc_a)
+    return -1;
+  if (!pfbc_b)
+    return 1;
+  int tmpattr;
+
+  // Avoid 10-bit colors
+  glXGetFBConfigAttrib(ps->dpy, pfbc_a->cfg, GLX_RED_SIZE, &tmpattr);
+  if (tmpattr != 8)
+    return -1;
+
+  glXGetFBConfigAttrib(ps->dpy, pfbc_b->cfg, GLX_RED_SIZE, &tmpattr);
+  if (tmpattr != 8)
+    return 1;
+
+#define P_CMPATTR_LT(attr) { if ((result = glx_cmp_fbconfig_cmpattr(ps, pfbc_a, pfbc_b, (attr)))) return -result; }
+#define P_CMPATTR_GT(attr) { if ((result = glx_cmp_fbconfig_cmpattr(ps, pfbc_a, pfbc_b, (attr)))) return result; }
+
+  P_CMPATTR_LT(GLX_BIND_TO_TEXTURE_RGBA_EXT);
+  P_CMPATTR_LT(GLX_DOUBLEBUFFER);
+  P_CMPATTR_LT(GLX_STENCIL_SIZE);
+  P_CMPATTR_LT(GLX_DEPTH_SIZE);
+  P_CMPATTR_GT(GLX_BIND_TO_MIPMAP_TEXTURE_EXT);
+
+  return 0;
+}
+
+/**
+ * @brief Update the FBConfig of given depth.
+ */
+static inline void
+glx_update_fbconfig_bydepth(session_t *ps, int depth, glx_fbconfig_t *pfbcfg) {
+  // Make sure the depth is sane
+  if (depth < 0 || depth > OPENGL_MAX_DEPTH)
+    return;
+
+  // Compare new FBConfig with current one
+  if (glx_cmp_fbconfig(ps, ps->psglx->fbconfigs[depth], pfbcfg) < 0) {
+    log_trace("(depth %d): %p overrides %p, target %#x.", depth,
+              pfbcfg->cfg,
+              ps->psglx->fbconfigs[depth] ? ps->psglx->fbconfigs[depth]->cfg:
+                                            0,
+              pfbcfg->texture_tgts);
+    if (!ps->psglx->fbconfigs[depth]) {
+      ps->psglx->fbconfigs[depth] = cmalloc(glx_fbconfig_t);
+    }
+    (*ps->psglx->fbconfigs[depth]) = *pfbcfg;
+  }
+}
+
+/**
+ * Get GLX FBConfigs for all depths.
+ */
+static bool
+glx_update_fbconfig(session_t *ps) {
+  // Acquire all FBConfigs and loop through them
+  int nele = 0;
+  GLXFBConfig* pfbcfgs = glXGetFBConfigs(ps->dpy, ps->scr, &nele);
+
+  for (GLXFBConfig *pcur = pfbcfgs; pcur < pfbcfgs + nele; pcur++) {
+    glx_fbconfig_t fbinfo = {
+      .cfg = *pcur,
+      .texture_fmt = 0,
+      .texture_tgts = 0,
+      .y_inverted = false,
+    };
+    int id = (int) (pcur - pfbcfgs);
+    int depth = 0, depth_alpha = 0, val = 0;
+
+    // Skip over multi-sampled visuals
+    // http://people.freedesktop.org/~glisse/0001-glx-do-not-use-multisample-visual-config-for-front-o.patch
+#ifdef GLX_SAMPLES
+    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_SAMPLES, &val)
+        && val > 1)
+      continue;
 #endif
 
+    if (Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BUFFER_SIZE, &depth)
+        || Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_ALPHA_SIZE, &depth_alpha)) {
+      log_error("Failed to retrieve buffer size and alpha size of FBConfig %d.", id);
+      continue;
+    }
+    if (Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_TARGETS_EXT, &fbinfo.texture_tgts)) {
+      log_error("Failed to retrieve BIND_TO_TEXTURE_TARGETS_EXT of FBConfig %d.", id);
+      continue;
+    }
+
+    int visualdepth = 0;
+    {
+      XVisualInfo *pvi = glXGetVisualFromFBConfig(ps->dpy, *pcur);
+      if (!pvi) {
+        // On nvidia-drivers-325.08 this happens slightly too often...
+        // log_error("Failed to retrieve X Visual of FBConfig %d.", id);
+        continue;
+      }
+      visualdepth = pvi->depth;
+      cxfree(pvi);
+    }
+
+    bool rgb = false;
+    bool rgba = false;
+
+    if (depth >= 32 && depth_alpha && Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_RGBA_EXT, &val) && val)
+      rgba = true;
+
+    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_RGB_EXT, &val) && val)
+      rgb = true;
+
+    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_Y_INVERTED_EXT, &val))
+      fbinfo.y_inverted = val;
+
+    {
+      int tgtdpt = depth - depth_alpha;
+      if (tgtdpt == visualdepth && tgtdpt < 32 && rgb) {
+        fbinfo.texture_fmt = GLX_TEXTURE_FORMAT_RGB_EXT;
+        glx_update_fbconfig_bydepth(ps, tgtdpt, &fbinfo);
+      }
+    }
+
+    if (depth == visualdepth && rgba) {
+      fbinfo.texture_fmt = GLX_TEXTURE_FORMAT_RGBA_EXT;
+      glx_update_fbconfig_bydepth(ps, depth, &fbinfo);
+    }
+  }
+
+  cxfree(pfbcfgs);
+
+  // Sanity checks
+  if (!ps->psglx->fbconfigs[ps->depth]) {
+    log_error("No FBConfig found for default depth %d.", ps->depth);
+    return false;
+  }
+
+  if (!ps->psglx->fbconfigs[32]) {
+    log_error("No FBConfig found for depth 32. Expect crazy things.");
+  }
+
+  log_trace("%d-bit: %p, 32-bit: %p", ps->depth, ps->psglx->fbconfigs[ps->depth]->cfg,
+            ps->psglx->fbconfigs[32]->cfg);
+
+  return true;
+}
+
+static inline XVisualInfo *
+get_visualinfo_from_visual(session_t *ps, xcb_visualid_t visual) {
+  XVisualInfo vreq = { .visualid = visual };
+  int nitems = 0;
+
+  return XGetVisualInfo(ps->dpy, VisualIDMask, &vreq, &nitems);
+}
+
+#ifdef DEBUG_GLX_DEBUG_CONTEXT
 static inline GLXFBConfig
 get_fbconfig_from_visualinfo(session_t *ps, const XVisualInfo *visualinfo) {
   int nelements = 0;
@@ -44,13 +203,12 @@ get_fbconfig_from_visualinfo(session_t *ps, const XVisualInfo *visualinfo) {
   return NULL;
 }
 
-#ifdef DEBUG_GLX_DEBUG_CONTEXT
 static void
 glx_debug_msg_callback(GLenum source, GLenum type,
     GLuint id, GLenum severity, GLsizei length, const GLchar *message,
     GLvoid *userParam) {
-  printf_dbgf("(): source 0x%04X, type 0x%04X, id %u, severity 0x%0X, \"%s\"\n",
-      source, type, id, severity, message);
+  log_trace("source 0x%04X, type 0x%04X, id %u, severity 0x%0X, \"%s\"",
+            source, type, id, severity, message);
 }
 #endif
 
@@ -67,15 +225,20 @@ glx_init(session_t *ps, bool need_render) {
     if (glXQueryExtension(ps->dpy, &ps->glx_event, &ps->glx_error))
       ps->glx_exists = true;
     else {
-      printf_errf("(): No GLX extension.");
+      log_error("No GLX extension.");
       goto glx_init_end;
     }
+  }
+
+  if (ps->o.glx_swap_method > CGLX_MAX_BUFFER_AGE) {
+    log_error("glx-swap-method is too big");
+    goto glx_init_end;
   }
 
   // Get XVisualInfo
   pvis = get_visualinfo_from_visual(ps, ps->vis);
   if (!pvis) {
-    printf_errf("(): Failed to acquire XVisualInfo for current visual.");
+    log_error("Failed to acquire XVisualInfo for current visual.");
     goto glx_init_end;
   }
 
@@ -83,13 +246,13 @@ glx_init(session_t *ps, bool need_render) {
   if (need_render) {
     int value = 0;
     if (Success != glXGetConfig(ps->dpy, pvis, GLX_USE_GL, &value) || !value) {
-      printf_errf("(): Root visual is not a GL visual.");
+      log_error("Root visual is not a GL visual.");
       goto glx_init_end;
     }
 
     if (Success != glXGetConfig(ps->dpy, pvis, GLX_DOUBLEBUFFER, &value)
         || !value) {
-      printf_errf("(): Root visual is not a double buffered GL visual.");
+      log_error("Root visual is not a double buffered GL visual.");
       goto glx_init_end;
     }
   }
@@ -101,17 +264,15 @@ glx_init(session_t *ps, bool need_render) {
   // Initialize GLX data structure
   if (!ps->psglx) {
     static const glx_session_t CGLX_SESSION_DEF = CGLX_SESSION_INIT;
-    ps->psglx = cmalloc(1, glx_session_t);
+    ps->psglx = cmalloc(glx_session_t);
     memcpy(ps->psglx, &CGLX_SESSION_DEF, sizeof(glx_session_t));
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
     for (int i = 0; i < MAX_BLUR_PASS; ++i) {
       glx_blur_pass_t *ppass = &ps->psglx->blur_passes[i];
       ppass->unifm_factor_center = -1;
       ppass->unifm_offset_x = -1;
       ppass->unifm_offset_y = -1;
     }
-#endif
   }
 
   glx_session_t *psglx = ps->psglx;
@@ -124,8 +285,7 @@ glx_init(session_t *ps, bool need_render) {
     {
       GLXFBConfig fbconfig = get_fbconfig_from_visualinfo(ps, pvis);
       if (!fbconfig) {
-        printf_errf("(): Failed to get GLXFBConfig for root visual %#lx.",
-            pvis->visualid);
+        log_error("Failed to get GLXFBConfig for root visual %#lx.", pvis->visualid);
         goto glx_init_end;
       }
 
@@ -133,7 +293,7 @@ glx_init(session_t *ps, bool need_render) {
         (f_glXCreateContextAttribsARB)
         glXGetProcAddress((const GLubyte *) "glXCreateContextAttribsARB");
       if (!p_glXCreateContextAttribsARB) {
-        printf_errf("(): Failed to get glXCreateContextAttribsARB().");
+        log_error("Failed to get glXCreateContextAttribsARB().");
         goto glx_init_end;
       }
 
@@ -147,13 +307,13 @@ glx_init(session_t *ps, bool need_render) {
 #endif
 
     if (!psglx->context) {
-      printf_errf("(): Failed to get GLX context.");
+      log_error("Failed to get GLX context.");
       goto glx_init_end;
     }
 
     // Attach GLX context
     if (!glXMakeCurrent(ps->dpy, get_tgt_window(ps), psglx->context)) {
-      printf_errf("(): Failed to attach GLX context.");
+      log_error("Failed to attach GLX context.");
       goto glx_init_end;
     }
 
@@ -163,7 +323,7 @@ glx_init(session_t *ps, bool need_render) {
         (f_DebugMessageCallback)
         glXGetProcAddress((const GLubyte *) "glDebugMessageCallback");
       if (!p_DebugMessageCallback) {
-        printf_errf("(): Failed to get glDebugMessageCallback(0.");
+        log_error("Failed to get glDebugMessageCallback(0.");
         goto glx_init_end;
       }
       p_DebugMessageCallback(glx_debug_msg_callback, ps);
@@ -179,7 +339,7 @@ glx_init(session_t *ps, bool need_render) {
     GLint val = 0;
     glGetIntegerv(GL_STENCIL_BITS, &val);
     if (!val) {
-      printf_errf("(): Target window doesn't have stencil buffer.");
+      log_error("Target window doesn't have stencil buffer.");
       goto glx_init_end;
     }
   }
@@ -204,39 +364,9 @@ glx_init(session_t *ps, bool need_render) {
     psglx->glXReleaseTexImageProc = (f_ReleaseTexImageEXT)
       glXGetProcAddress((const GLubyte *) "glXReleaseTexImageEXT");
     if (!psglx->glXBindTexImageProc || !psglx->glXReleaseTexImageProc) {
-      printf_errf("(): Failed to acquire glXBindTexImageEXT() / glXReleaseTexImageEXT().");
+      log_error("Failed to acquire glXBindTexImageEXT() / glXReleaseTexImageEXT().");
       goto glx_init_end;
     }
-
-    if (ps->o.glx_use_copysubbuffermesa) {
-      psglx->glXCopySubBufferProc = (f_CopySubBuffer)
-        glXGetProcAddress((const GLubyte *) "glXCopySubBufferMESA");
-      if (!psglx->glXCopySubBufferProc) {
-        printf_errf("(): Failed to acquire glXCopySubBufferMESA().");
-        goto glx_init_end;
-      }
-    }
-
-#ifdef CONFIG_GLX_SYNC
-    psglx->glFenceSyncProc = (f_FenceSync)
-      glXGetProcAddress((const GLubyte *) "glFenceSync");
-    psglx->glIsSyncProc = (f_IsSync)
-      glXGetProcAddress((const GLubyte *) "glIsSync");
-    psglx->glDeleteSyncProc = (f_DeleteSync)
-      glXGetProcAddress((const GLubyte *) "glDeleteSync");
-    psglx->glClientWaitSyncProc = (f_ClientWaitSync)
-      glXGetProcAddress((const GLubyte *) "glClientWaitSync");
-    psglx->glWaitSyncProc = (f_WaitSync)
-      glXGetProcAddress((const GLubyte *) "glWaitSync");
-    psglx->glImportSyncEXT = (f_ImportSyncEXT)
-      glXGetProcAddress((const GLubyte *) "glImportSyncEXT");
-    if (!psglx->glFenceSyncProc || !psglx->glIsSyncProc || !psglx->glDeleteSyncProc
-        || !psglx->glClientWaitSyncProc || !psglx->glWaitSyncProc
-        || !psglx->glImportSyncEXT) {
-      printf_errf("(): Failed to acquire GLX sync functions.");
-      goto glx_init_end;
-    }
-#endif
   }
 
   // Acquire FBConfigs
@@ -277,8 +407,6 @@ glx_init_end:
   return success;
 }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-
 static void
 glx_free_prog_main(session_t *ps, glx_prog_main_t *pprogram) {
   if (!pprogram)
@@ -292,8 +420,6 @@ glx_free_prog_main(session_t *ps, glx_prog_main_t *pprogram) {
   pprogram->unifm_tex = -1;
 }
 
-#endif
-
 /**
  * Destroy GLX related resources.
  */
@@ -306,7 +432,6 @@ glx_destroy(session_t *ps) {
   for (win *w = ps->list; w; w = w->next)
     free_win_res_glx(ps, w);
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
   // Free GLSL shaders/programs
   for (int i = 0; i < MAX_BLUR_PASS; ++i) {
     glx_blur_pass_t *ppass = &ps->psglx->blur_passes[i];
@@ -316,10 +441,9 @@ glx_destroy(session_t *ps) {
       glDeleteProgram(ppass->prog);
   }
 
-  glx_free_prog_main(ps, &ps->o.glx_prog_win);
+  glx_free_prog_main(ps, &ps->glx_prog_win);
 
   glx_check_err(ps);
-#endif
 
   // Free FBConfigs
   for (int i = 0; i <= OPENGL_MAX_DEPTH; ++i) {
@@ -347,12 +471,12 @@ glx_reinit(session_t *ps, bool need_render) {
 
   glx_destroy(ps);
   if (!glx_init(ps, need_render)) {
-    printf_errf("(): Failed to initialize GLX.");
+    log_error("Failed to initialize GLX.");
     return false;
   }
 
   if (!vsync_init(ps)) {
-    printf_errf("(): Failed to initialize VSync.");
+    log_error("Failed to initialize VSync.");
     return false;
   }
 
@@ -383,25 +507,19 @@ glx_init_conv_blur(session_t *ps) {
 
   // Allocate PBO if more than one blur kernel is present
   if (ps->o.blur_kerns[1]) {
-#ifdef CONFIG_VSYNC_OPENGL_FBO
     // Try to generate a framebuffer
     GLuint fbo = 0;
     glGenFramebuffers(1, &fbo);
     if (!fbo) {
-      printf_errf("(): Failed to generate Framebuffer. Cannot do "
-          "multi-pass blur with GLX backend.");
+      log_error("Failed to generate Framebuffer. Cannot do multi-pass blur with GLX"
+                " backend.");
       return false;
     }
     glDeleteFramebuffers(1, &fbo);
-#else
-    printf_errf("(): FBO support not compiled in. Cannot do multi-pass blur "
-        "with GLX backend.");
-    return false;
-#endif
   }
 
   {
-    char *lc_numeric_old = mstrcpy(setlocale(LC_NUMERIC, NULL));
+    char *lc_numeric_old = strdup(setlocale(LC_NUMERIC, NULL));
     // Enforce LC_NUMERIC locale "C" here to make sure decimal point is sane
     // Thanks to hiciu for reporting.
     setlocale(LC_NUMERIC, "C");
@@ -431,7 +549,7 @@ glx_init_conv_blur(session_t *ps) {
     const char *texture_func = (use_texture_rect ?
         "texture2DRect": "texture2D");
     const char *shader_add = FRAG_SHADER_BLUR_ADD;
-    char *extension = mstrcpy("");
+    char *extension = strdup("");
     if (use_texture_rect)
       mstrextend(&extension, "#extension GL_ARB_texture_rectangle : require\n");
     if (ps->o.glx_use_gpushader4) {
@@ -440,7 +558,7 @@ glx_init_conv_blur(session_t *ps) {
     }
 
     for (int i = 0; i < MAX_BLUR_PASS && ps->o.blur_kerns[i]; ++i) {
-      XFixed *kern = ps->o.blur_kerns[i];
+      xcb_render_fixed_t *kern = ps->o.blur_kerns[i];
       if (!kern)
         break;
 
@@ -448,54 +566,50 @@ glx_init_conv_blur(session_t *ps) {
 
       // Build shader
       {
-        int wid = XFixedToDouble(kern[0]), hei = XFixedToDouble(kern[1]);
+        int wid = XFIXED_TO_DOUBLE(kern[0]), hei = XFIXED_TO_DOUBLE(kern[1]);
         int nele = wid * hei - 1;
-        int len = strlen(FRAG_SHADER_BLUR_PREFIX) + strlen(sampler_type) + strlen(extension) + (strlen(shader_add) + strlen(texture_func) + 42) * nele + strlen(FRAG_SHADER_BLUR_SUFFIX) + strlen(texture_func) + 12 + 1;
-        char *shader_str = calloc(len, sizeof(char));
-        if (!shader_str) {
-          printf_errf("(): Failed to allocate %d bytes for shader string.", len);
-          return false;
-        }
-        {
-          char *pc = shader_str;
-          sprintf(pc, FRAG_SHADER_BLUR_PREFIX, extension, sampler_type);
-          pc += strlen(pc);
-          assert(strlen(shader_str) < len);
+        unsigned int len = strlen(FRAG_SHADER_BLUR_PREFIX) +
+                           strlen(sampler_type) +
+                           strlen(extension) +
+                           (strlen(shader_add) + strlen(texture_func) + 42) * nele +
+                           strlen(FRAG_SHADER_BLUR_SUFFIX) +
+                           strlen(texture_func) + 12 + 1;
+        char *shader_str = ccalloc(len, char);
+        char *pc = shader_str;
+        sprintf(pc, FRAG_SHADER_BLUR_PREFIX, extension, sampler_type);
+        pc += strlen(pc);
+        assert(strlen(shader_str) < len);
 
-          double sum = 0.0;
-          for (int j = 0; j < hei; ++j) {
-            for (int k = 0; k < wid; ++k) {
-              if (hei / 2 == j && wid / 2 == k)
-                continue;
-              double val = XFixedToDouble(kern[2 + j * wid + k]);
-              if (0.0 == val)
-                continue;
-              sum += val;
-              sprintf(pc, shader_add, val, texture_func, k - wid / 2, j - hei / 2);
-              pc += strlen(pc);
-              assert(strlen(shader_str) < len);
-            }
+        double sum = 0.0;
+        for (int j = 0; j < hei; ++j) {
+          for (int k = 0; k < wid; ++k) {
+            if (hei / 2 == j && wid / 2 == k)
+              continue;
+            double val = XFIXED_TO_DOUBLE(kern[2 + j * wid + k]);
+            if (0.0 == val)
+              continue;
+            sum += val;
+            sprintf(pc, shader_add, val, texture_func, k - wid / 2, j - hei / 2);
+            pc += strlen(pc);
+            assert(strlen(shader_str) < len);
           }
-
-          sprintf(pc, FRAG_SHADER_BLUR_SUFFIX, texture_func, sum);
-          assert(strlen(shader_str) < len);
         }
-#ifdef DEBUG_GLX
-        printf_dbgf("(): Generated convolution shader:\n%s\n", shader_str);
-#endif
+
+        sprintf(pc, FRAG_SHADER_BLUR_SUFFIX, texture_func, sum);
+        assert(strlen(shader_str) < len);
         ppass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
         free(shader_str);
       }
 
       if (!ppass->frag_shader) {
-        printf_errf("(): Failed to create fragment shader %d.", i);
+        log_error("Failed to create fragment shader %d.", i);
         return false;
       }
 
       // Build program
       ppass->prog = glx_create_program(&ppass->frag_shader, 1);
       if (!ppass->prog) {
-        printf_errf("(): Failed to create GLSL program.");
+        log_error("Failed to create GLSL program.");
         return false;
       }
 
@@ -503,7 +617,7 @@ glx_init_conv_blur(session_t *ps) {
 #define P_GET_UNIFM_LOC(name, target) { \
       ppass->target = glGetUniformLocation(ppass->prog, name); \
       if (ppass->target < 0) { \
-        printf_errf("(): Failed to get location of %d-th uniform '" name "'. Might be troublesome.", i); \
+        log_error("Failed to get location of %d-th uniform '" name "'. Might be troublesome.", i); \
       } \
     }
 
@@ -528,211 +642,6 @@ glx_init_conv_blur(session_t *ps) {
   return true;
 }
 
-bool
-glx_init_kawase_blur(session_t *ps) {
-  // Allocate PBO to check for multi-pass support
-#ifdef CONFIG_VSYNC_OPENGL_FBO
-  {
-    // Try to generate a framebuffer
-    GLuint fbo = 0;
-    glGenFramebuffers(1, &fbo);
-    if (!fbo) {
-      printf_errf("(): Failed to generate Framebuffer. Cannot do "
-          "multi-pass blur with GLX backend.");
-      return false;
-    }
-    glDeleteFramebuffers(1, &fbo);
-#else
-    printf_errf("(): FBO support not compiled in. Cannot do multi-pass blur "
-        "with GLX backend.");
-    return false;
-#endif
-  }
-
-  {
-    char *lc_numeric_old = mstrcpy(setlocale(LC_NUMERIC, NULL));
-    // Enforce LC_NUMERIC locale "C" here to make sure decimal point is sane
-    // Thanks to hiciu for reporting.
-    setlocale(LC_NUMERIC, "C");
-
-    static const char *FRAG_SHADER_PREFIX =
-      "#version 110\n"
-      "%s"  // extensions
-      "uniform float offset;\n"
-      "uniform vec2 halfpixel;\n"
-      "uniform vec2 fulltex;\n"
-      "uniform %s tex_scr;\n" // sampler2D | sampler2DRect
-      "vec4 clamp_tex(vec2 uv)\n"
-      "{\n"
-      "  return %s(tex_scr, clamp(uv, vec2(0), fulltex));\n" // texture2D | texture2DRect
-      "}\n"
-      "\n"
-      "void main()\n"
-      "{\n"
-      "  vec2 uv = (gl_TexCoord[0].xy / fulltex);\n"
-      "\n";
-
-    // Fragment shader (Dual Kawase Blur) - Downsample
-    static const char *FRAG_SHADER_KAWASE_DOWN =
-      "  vec4 sum = clamp_tex(uv) * 4.0;\n"
-      "  sum += clamp_tex(uv - halfpixel.xy * offset);\n"
-      "  sum += clamp_tex(uv + halfpixel.xy * offset);\n"
-      "  sum += clamp_tex(uv + vec2(halfpixel.x, -halfpixel.y) * offset);\n"
-      "  sum += clamp_tex(uv - vec2(halfpixel.x, -halfpixel.y) * offset);\n"
-      "\n"
-      "  gl_FragColor = sum / 8.0;\n"
-      "}\n";
-
-    // Fragment shader (Dual Kawase Blur) - Upsample
-    static const char *FRAG_SHADER_KAWASE_UP =
-      "  vec4 sum = clamp_tex(uv + vec2(-halfpixel.x * 2.0, 0.0) * offset);\n"
-      "  sum += clamp_tex(uv + vec2(-halfpixel.x, halfpixel.y) * offset) * 2.0;\n"
-      "  sum += clamp_tex(uv + vec2(0.0, halfpixel.y * 2.0) * offset);\n"
-      "  sum += clamp_tex(uv + vec2(halfpixel.x, halfpixel.y) * offset) * 2.0;\n"
-      "  sum += clamp_tex(uv + vec2(halfpixel.x * 2.0, 0.0) * offset);\n"
-      "  sum += clamp_tex(uv + vec2(halfpixel.x, -halfpixel.y) * offset) * 2.0;\n"
-      "  sum += clamp_tex(uv + vec2(0.0, -halfpixel.y * 2.0) * offset);\n"
-      "  sum += clamp_tex(uv + vec2(-halfpixel.x, -halfpixel.y) * offset) * 2.0;\n"
-      "\n"
-      "  gl_FragColor = sum / 12.0;\n"
-      "}\n";
-
-    const bool use_texture_rect = !ps->psglx->has_texture_non_power_of_two;
-    const char *sampler_type = (use_texture_rect ?
-        "sampler2DRect": "sampler2D");
-    const char *texture_func = (use_texture_rect ?
-        "texture2DRect": "texture2D");
-    char *extension = mstrcpy("");
-    if (use_texture_rect)
-      mstrextend(&extension, "#extension GL_ARB_texture_rectangle : require\n");
-
-    // Build kawase downsample shader
-    glx_blur_pass_t *down_pass = &ps->psglx->blur_passes[0];
-    {
-      int len = strlen(FRAG_SHADER_PREFIX) + strlen(extension) + strlen(sampler_type) + strlen(texture_func) + strlen(FRAG_SHADER_KAWASE_DOWN) + 1;
-      char *shader_str = calloc(len, sizeof(char));
-      if (!shader_str) {
-        printf_errf("(): Failed to allocate %d bytes for shader string.", len);
-        return false;
-      }
-
-      char *pc = shader_str;
-      sprintf(pc, FRAG_SHADER_PREFIX, extension, sampler_type, texture_func);
-      pc += strlen(pc);
-      assert(strlen(shader_str) < len);
-
-      sprintf(pc, FRAG_SHADER_KAWASE_DOWN);
-      assert(strlen(shader_str) < len);
-#ifdef DEBUG_GLX
-      printf_dbgf("(): Generated kawase downsample shader:\n%s\n", shader_str);
-#endif
-      down_pass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
-      free(shader_str);
-
-      if (!down_pass->frag_shader) {
-        printf_errf("(): Failed to create kawase downsample fragment shader.");
-        return false;
-      }
-
-      // Build program
-      down_pass->prog = glx_create_program(&down_pass->frag_shader, 1);
-      if (!down_pass->prog) {
-        printf_errf("(): Failed to create GLSL program.");
-        return false;
-      }
-
-      // Get uniform addresses
-#define P_GET_UNIFM_LOC(name, target) { \
-      down_pass->target = glGetUniformLocation(down_pass->prog, name); \
-      if (down_pass->target < 0) { \
-        printf_errf("(): Failed to get location of kawase downsample uniform '" name "'. Might be troublesome."); \
-      } \
-    }
-      P_GET_UNIFM_LOC("offset", unifm_offset);
-      P_GET_UNIFM_LOC("halfpixel", unifm_halfpixel);
-      P_GET_UNIFM_LOC("fulltex", unifm_fulltex);
-#undef P_GET_UNIFM_LOC
-    }
-
-    // Build kawase downsample shader
-    glx_blur_pass_t *up_pass = &ps->psglx->blur_passes[1];
-    {
-      int len = strlen(FRAG_SHADER_PREFIX) + strlen(extension) + strlen(sampler_type) + strlen(texture_func) + strlen(FRAG_SHADER_KAWASE_UP) + 1;
-      char *shader_str = calloc(len, sizeof(char));
-      if (!shader_str) {
-        printf_errf("(): Failed to allocate %d bytes for shader string.", len);
-        return false;
-      }
-
-      char *pc = shader_str;
-      sprintf(pc, FRAG_SHADER_PREFIX, extension, sampler_type, texture_func);
-      pc += strlen(pc);
-      assert(strlen(shader_str) < len);
-
-      sprintf(pc, FRAG_SHADER_KAWASE_UP);
-      assert(strlen(shader_str) < len);
-#ifdef DEBUG_GLX
-      printf_dbgf("(): Generated kawase upsample shader:\n%s\n", shader_str);
-#endif
-      up_pass->frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, shader_str);
-      free(shader_str);
-
-      if (!up_pass->frag_shader) {
-        printf_errf("(): Failed to create kawase upsample fragment shader.");
-        return false;
-      }
-
-      // Build program
-      up_pass->prog = glx_create_program(&up_pass->frag_shader, 1);
-      if (!up_pass->prog) {
-        printf_errf("(): Failed to create GLSL program.");
-        return false;
-      }
-
-      // Get uniform addresses
-#define P_GET_UNIFM_LOC(name, target) { \
-      up_pass->target = glGetUniformLocation(up_pass->prog, name); \
-      if (up_pass->target < 0) { \
-        printf_errf("(): Failed to get location of kawase upsample uniform '" name "'. Might be troublesome."); \
-      } \
-    }
-      P_GET_UNIFM_LOC("offset", unifm_offset);
-      P_GET_UNIFM_LOC("halfpixel", unifm_halfpixel);
-      P_GET_UNIFM_LOC("fulltex", unifm_fulltex);
-#undef P_GET_UNIFM_LOC
-    }
-
-    free(extension);
-
-    // Restore LC_NUMERIC
-    setlocale(LC_NUMERIC, lc_numeric_old);
-    free(lc_numeric_old);
-  }
-
-  glx_check_err(ps);
-
-  return true;
-}
-
-bool
-glx_init_blur(session_t *ps) {
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-  switch (ps->o.blur_method) {
-    case BLRMTHD_CONV:
-      return glx_init_conv_blur(ps);
-    case BLRMTHD_KAWASE:
-      return glx_init_kawase_blur(ps);
-    default:
-      return false;
-  }
-#else
-  printf_errf("(): GLSL support not compiled in. Cannot do blur with GLX backend.");
-  return false;
-#endif
-}
-
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-
 /**
  * Load a GLSL main program from shader strings.
  */
@@ -745,7 +654,7 @@ glx_load_prog_main(session_t *ps,
   // Build program
   pprogram->prog = glx_create_program_from_str(vshader_str, fshader_str);
   if (!pprogram->prog) {
-    printf_errf("(): Failed to create GLSL program.");
+    log_error("Failed to create GLSL program.");
     return false;
   }
 
@@ -753,7 +662,7 @@ glx_load_prog_main(session_t *ps,
 #define P_GET_UNIFM_LOC(name, target) { \
       pprogram->target = glGetUniformLocation(pprogram->prog, name); \
       if (pprogram->target < 0) { \
-        printf_errf("(): Failed to get location of uniform '" name "'. Might be troublesome."); \
+        log_error("Failed to get location of uniform '" name "'. Might be troublesome."); \
       } \
     }
   P_GET_UNIFM_LOC("opacity", unifm_opacity);
@@ -766,173 +675,17 @@ glx_load_prog_main(session_t *ps,
   return true;
 }
 
-#endif
-
-/**
- * @brief Update the FBConfig of given depth.
- */
-static inline void
-glx_update_fbconfig_bydepth(session_t *ps, int depth, glx_fbconfig_t *pfbcfg) {
-  // Make sure the depth is sane
-  if (depth < 0 || depth > OPENGL_MAX_DEPTH)
-    return;
-
-  // Compare new FBConfig with current one
-  if (glx_cmp_fbconfig(ps, ps->psglx->fbconfigs[depth], pfbcfg) < 0) {
-#ifdef DEBUG_GLX
-    printf_dbgf("(%d): %#x overrides %#x, target %#x.\n", depth, (unsigned) pfbcfg->cfg, (ps->psglx->fbconfigs[depth] ? (unsigned) ps->psglx->fbconfigs[depth]->cfg: 0), pfbcfg->texture_tgts);
-#endif
-    if (!ps->psglx->fbconfigs[depth]) {
-      ps->psglx->fbconfigs[depth] = malloc(sizeof(glx_fbconfig_t));
-      allocchk(ps->psglx->fbconfigs[depth]);
-    }
-    (*ps->psglx->fbconfigs[depth]) = *pfbcfg;
-  }
-}
-
-/**
- * Get GLX FBConfigs for all depths.
- */
-static bool
-glx_update_fbconfig(session_t *ps) {
-  // Acquire all FBConfigs and loop through them
-  int nele = 0;
-  GLXFBConfig* pfbcfgs = glXGetFBConfigs(ps->dpy, ps->scr, &nele);
-
-  for (GLXFBConfig *pcur = pfbcfgs; pcur < pfbcfgs + nele; pcur++) {
-    glx_fbconfig_t fbinfo = {
-      .cfg = *pcur,
-      .texture_fmt = 0,
-      .texture_tgts = 0,
-      .y_inverted = false,
-    };
-    int id = (int) (pcur - pfbcfgs);
-    int depth = 0, depth_alpha = 0, val = 0;
-
-    // Skip over multi-sampled visuals
-    // http://people.freedesktop.org/~glisse/0001-glx-do-not-use-multisample-visual-config-for-front-o.patch
-#ifdef GLX_SAMPLES
-    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_SAMPLES, &val)
-        && val > 1)
-      continue;
-#endif
-
-    if (Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BUFFER_SIZE, &depth)
-        || Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_ALPHA_SIZE, &depth_alpha)) {
-      printf_errf("(): Failed to retrieve buffer size and alpha size of FBConfig %d.", id);
-      continue;
-    }
-    if (Success != glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_TARGETS_EXT, &fbinfo.texture_tgts)) {
-      printf_errf("(): Failed to retrieve BIND_TO_TEXTURE_TARGETS_EXT of FBConfig %d.", id);
-      continue;
-    }
-
-    int visualdepth = 0;
-    {
-      XVisualInfo *pvi = glXGetVisualFromFBConfig(ps->dpy, *pcur);
-      if (!pvi) {
-        // On nvidia-drivers-325.08 this happens slightly too often...
-        // printf_errf("(): Failed to retrieve X Visual of FBConfig %d.", id);
-        continue;
-      }
-      visualdepth = pvi->depth;
-      cxfree(pvi);
-    }
-
-    bool rgb = false;
-    bool rgba = false;
-
-    if (depth >= 32 && depth_alpha && Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_RGBA_EXT, &val) && val)
-      rgba = true;
-
-    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_BIND_TO_TEXTURE_RGB_EXT, &val) && val)
-      rgb = true;
-
-    if (Success == glXGetFBConfigAttrib(ps->dpy, *pcur, GLX_Y_INVERTED_EXT, &val))
-      fbinfo.y_inverted = val;
-
-    {
-      int tgtdpt = depth - depth_alpha;
-      if (tgtdpt == visualdepth && tgtdpt < 32 && rgb) {
-        fbinfo.texture_fmt = GLX_TEXTURE_FORMAT_RGB_EXT;
-        glx_update_fbconfig_bydepth(ps, tgtdpt, &fbinfo);
-      }
-    }
-
-    if (depth == visualdepth && rgba) {
-      fbinfo.texture_fmt = GLX_TEXTURE_FORMAT_RGBA_EXT;
-      glx_update_fbconfig_bydepth(ps, depth, &fbinfo);
-    }
-  }
-
-  cxfree(pfbcfgs);
-
-  // Sanity checks
-  if (!ps->psglx->fbconfigs[ps->depth]) {
-    printf_errf("(): No FBConfig found for default depth %d.", ps->depth);
-    return false;
-  }
-
-  if (!ps->psglx->fbconfigs[32]) {
-    printf_errf("(): No FBConfig found for depth 32. Expect crazy things.");
-  }
-
-#ifdef DEBUG_GLX
-  printf_dbgf("(): %d-bit: %#3x, 32-bit: %#3x\n",
-      ps->depth, (int) ps->psglx->fbconfigs[ps->depth]->cfg,
-      (int) ps->psglx->fbconfigs[32]->cfg);
-#endif
-
-  return true;
-}
-
-static inline int
-glx_cmp_fbconfig_cmpattr(session_t *ps,
-    const glx_fbconfig_t *pfbc_a, const glx_fbconfig_t *pfbc_b,
-    int attr) {
-  int attr_a = 0, attr_b = 0;
-
-  // TODO: Error checking
-  glXGetFBConfigAttrib(ps->dpy, pfbc_a->cfg, attr, &attr_a);
-  glXGetFBConfigAttrib(ps->dpy, pfbc_b->cfg, attr, &attr_b);
-
-  return attr_a - attr_b;
-}
-
-/**
- * Compare two GLX FBConfig's to find the preferred one.
- */
-static int
-glx_cmp_fbconfig(session_t *ps,
-    const glx_fbconfig_t *pfbc_a, const glx_fbconfig_t *pfbc_b) {
-  int result = 0;
-
-  if (!pfbc_a)
-    return -1;
-  if (!pfbc_b)
-    return 1;
-
-#define P_CMPATTR_LT(attr) { if ((result = glx_cmp_fbconfig_cmpattr(ps, pfbc_a, pfbc_b, (attr)))) return -result; }
-#define P_CMPATTR_GT(attr) { if ((result = glx_cmp_fbconfig_cmpattr(ps, pfbc_a, pfbc_b, (attr)))) return result; }
-
-  P_CMPATTR_LT(GLX_BIND_TO_TEXTURE_RGBA_EXT);
-  P_CMPATTR_LT(GLX_DOUBLEBUFFER);
-  P_CMPATTR_LT(GLX_STENCIL_SIZE);
-  P_CMPATTR_LT(GLX_DEPTH_SIZE);
-  P_CMPATTR_GT(GLX_BIND_TO_MIPMAP_TEXTURE_EXT);
-
-  return 0;
-}
-
 /**
  * Bind a X pixmap to an OpenGL texture.
  */
 bool
-glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
+glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, xcb_pixmap_t pixmap,
     unsigned width, unsigned height, unsigned depth) {
+  if (ps->o.backend != BKEND_GLX && ps->o.backend != BKEND_XR_GLX_HYBRID)
+    return true;
+
   if (!pixmap) {
-    printf_errf("(%#010lx): Binding to an empty pixmap. This can't work.",
-        pixmap);
+    log_error("Binding to an empty pixmap %#010x. This can't work.", pixmap);
     return false;
   }
 
@@ -952,7 +705,7 @@ glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
       .y_inverted = false,
     };
 
-    ptex = malloc(sizeof(glx_texture_t));
+    ptex = cmalloc(glx_texture_t);
     allocchk(ptex);
     memcpy(ptex, &GLX_TEX_DEF, sizeof(glx_texture_t));
     *pptex = ptex;
@@ -974,19 +727,19 @@ glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
       unsigned rbdwid = 0;
       if (!XGetGeometry(ps->dpy, pixmap, &rroot, &rx, &ry,
             &width, &height, &rbdwid, &depth)) {
-        printf_errf("(%#010lx): Failed to query Pixmap info.", pixmap);
+        log_error("Failed to query info of pixmap %#010x.", pixmap);
         return false;
       }
       if (depth > OPENGL_MAX_DEPTH) {
-        printf_errf("(%d): Requested depth higher than %d.", depth,
-            OPENGL_MAX_DEPTH);
+        log_error("Requested depth %d higher than %d.", depth,
+                  OPENGL_MAX_DEPTH);
         return false;
       }
     }
 
     const glx_fbconfig_t *pcfg = ps->psglx->fbconfigs[depth];
     if (!pcfg) {
-      printf_errf("(%d): Couldn't find FBConfig with requested depth.", depth);
+      log_error("Couldn't find FBConfig with requested depth %d.", depth);
       return false;
     }
 
@@ -1004,10 +757,8 @@ glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
     else
       tex_tgt = GLX_TEXTURE_2D_EXT;
 
-#ifdef DEBUG_GLX
-    printf_dbgf("(): depth %d, tgt %#x, rgba %d\n", depth, tex_tgt,
-        (GLX_TEXTURE_FORMAT_RGBA_EXT == pcfg->texture_fmt));
-#endif
+    log_debug("depth %d, tgt %#x, rgba %d", depth, tex_tgt,
+              (GLX_TEXTURE_FORMAT_RGBA_EXT == pcfg->texture_fmt));
 
     GLint attrs[] = {
         GLX_TEXTURE_FORMAT_EXT,
@@ -1027,7 +778,7 @@ glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
     ptex->y_inverted = pcfg->y_inverted;
   }
   if (!ptex->glpixmap) {
-    printf_errf("(): Failed to allocate GLX pixmap.");
+    log_error("Failed to allocate GLX pixmap.");
     return false;
   }
 
@@ -1051,7 +802,7 @@ glx_bind_pixmap(session_t *ps, glx_texture_t **pptex, Pixmap pixmap,
     ptex->texture = texture;
   }
   if (!ptex->texture) {
-    printf_errf("(): Failed to allocate texture.");
+    log_error("Failed to allocate texture.");
     return false;
   }
 
@@ -1098,7 +849,7 @@ glx_release_pixmap(session_t *ps, glx_texture_t *ptex) {
  * Preprocess function before start painting.
  */
 void
-glx_paint_pre(session_t *ps, XserverRegion *preg) {
+glx_paint_pre(session_t *ps, region_t *preg) {
   ps->psglx->z = 0.0;
   // glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -1106,107 +857,46 @@ glx_paint_pre(session_t *ps, XserverRegion *preg) {
   bool trace_damage = (ps->o.glx_swap_method < 0 || ps->o.glx_swap_method > 1);
 
   // Trace raw damage regions
-  XserverRegion newdamage = None;
-  if (trace_damage && *preg)
-    newdamage = copy_region(ps, *preg);
+  region_t newdamage;
+  pixman_region32_init(&newdamage);
+  if (trace_damage)
+    copy_region(&newdamage, preg);
 
-  // OpenGL doesn't support partial repaint without GLX_MESA_copy_sub_buffer,
-  // we could redraw the whole screen or copy unmodified pixels from
-  // front buffer with --glx-copy-from-front.
-  if (ps->o.glx_use_copysubbuffermesa || !*preg) {
+  // We use GLX buffer_age extension to decide which pixels in
+  // the back buffer is reusable, and limit our redrawing
+  int buffer_age = 0;
+
+  // Query GLX_EXT_buffer_age for buffer age
+  if (ps->o.glx_swap_method == SWAPM_BUFFER_AGE) {
+    unsigned val = 0;
+    glXQueryDrawable(ps->dpy, get_tgt_window(ps),
+        GLX_BACK_BUFFER_AGE_EXT, &val);
+    buffer_age = val;
   }
-  else {
-    int buffer_age = ps->o.glx_swap_method;
 
-    // Getting buffer age
-    {
-      // Query GLX_EXT_buffer_age for buffer age
-      if (SWAPM_BUFFER_AGE == buffer_age) {
-        unsigned val = 0;
-        glXQueryDrawable(ps->dpy, get_tgt_window(ps),
-            GLX_BACK_BUFFER_AGE_EXT, &val);
-        buffer_age = val;
-      }
+  // Buffer age too high
+  if (buffer_age > CGLX_MAX_BUFFER_AGE + 1)
+    buffer_age = 0;
 
-      // Buffer age too high
-      if (buffer_age > CGLX_MAX_BUFFER_AGE + 1)
-        buffer_age = 0;
+  assert(buffer_age >= 0);
 
-      // Make sure buffer age >= 0
-      buffer_age = max_i(buffer_age, 0);
-
-      // Check if we have we have empty regions
-      if (buffer_age > 1) {
-        for (int i = 0; i < buffer_age - 1; ++i)
-          if (!ps->all_damage_last[i]) { buffer_age = 0; break; }
-      }
-    }
-
-    // Do nothing for buffer_age 1 (copy)
-    if (1 != buffer_age) {
-      // Copy pixels
-      if (ps->o.glx_copy_from_front) {
-        // Determine copy area
-        XserverRegion reg_copy = XFixesCreateRegion(ps->dpy, NULL, 0);
-        if (!buffer_age) {
-          XFixesSubtractRegion(ps->dpy, reg_copy, ps->screen_reg, *preg);
-        }
-        else {
-          for (int i = 0; i < buffer_age - 1; ++i)
-            XFixesUnionRegion(ps->dpy, reg_copy, reg_copy,
-                ps->all_damage_last[i]);
-          XFixesSubtractRegion(ps->dpy, reg_copy, reg_copy, *preg);
-        }
-
-        // Actually copy pixels
-        {
-          GLfloat raster_pos[4];
-          GLfloat curx = 0.0f, cury = 0.0f;
-          glGetFloatv(GL_CURRENT_RASTER_POSITION, raster_pos);
-          glReadBuffer(GL_FRONT);
-          glRasterPos2f(0.0, 0.0);
-          {
-            int nrects = 0;
-            XRectangle *rects = XFixesFetchRegion(ps->dpy, reg_copy, &nrects);
-            for (int i = 0; i < nrects; ++i) {
-              const int x = rects[i].x;
-              const int y = ps->root_height - rects[i].y - rects[i].height;
-              // Kwin patch says glRasterPos2f() causes artifacts on bottom
-              // screen edge with some drivers
-              glBitmap(0, 0, 0, 0, x - curx, y - cury, NULL);
-              curx = x;
-              cury = y;
-              glCopyPixels(x, y, rects[i].width, rects[i].height, GL_COLOR);
-            }
-            cxfree(rects);
-          }
-          glReadBuffer(GL_BACK);
-          glRasterPos4fv(raster_pos);
-        }
-
-        free_region(ps, &reg_copy);
-      }
-
-      // Determine paint area
-      if (ps->o.glx_copy_from_front) { }
-      else if (buffer_age) {
-        for (int i = 0; i < buffer_age - 1; ++i)
-          XFixesUnionRegion(ps->dpy, *preg, *preg, ps->all_damage_last[i]);
-      }
-      else {
-        free_region(ps, preg);
-      }
-    }
-  }
+  if (buffer_age) {
+    // Determine paint area
+      for (int i = 0; i < buffer_age - 1; ++i)
+        pixman_region32_union(preg, preg, &ps->all_damage_last[i]);
+  } else
+    // buffer_age == 0 means buffer age is not available, paint everything
+    copy_region(preg, &ps->screen_reg);
 
   if (trace_damage) {
-    free_region(ps, &ps->all_damage_last[CGLX_MAX_BUFFER_AGE - 1]);
+    // XXX use a circular queue instead of memmove
+    pixman_region32_fini(&ps->all_damage_last[CGLX_MAX_BUFFER_AGE - 1]);
     memmove(ps->all_damage_last + 1, ps->all_damage_last,
-        (CGLX_MAX_BUFFER_AGE - 1) * sizeof(XserverRegion));
+        (CGLX_MAX_BUFFER_AGE - 1) * sizeof(region_t));
     ps->all_damage_last[0] = newdamage;
   }
 
-  glx_set_clip(ps, *preg, NULL);
+  glx_set_clip(ps, preg);
 
 #ifdef DEBUG_GLX_PAINTREG
   glx_render_color(ps, 0, 0, ps->root_width, ps->root_height, 0, *preg, NULL);
@@ -1219,12 +909,10 @@ glx_paint_pre(session_t *ps, XserverRegion *preg) {
  * Set clipping region on the target window.
  */
 void
-glx_set_clip(session_t *ps, XserverRegion reg, const reg_data_t *pcache_reg) {
+glx_set_clip(session_t *ps, const region_t *reg) {
   // Quit if we aren't using stencils
   if (ps->o.glx_no_stencil)
     return;
-
-  static XRectangle rect_blank = { .x = 0, .y = 0, .width = 0, .height = 0 };
 
   glDisable(GL_STENCIL_TEST);
   glDisable(GL_SCISSOR_TEST);
@@ -1232,105 +920,35 @@ glx_set_clip(session_t *ps, XserverRegion reg, const reg_data_t *pcache_reg) {
   if (!reg)
     return;
 
-  int nrects = 0;
-  XRectangle *rects_free = NULL;
-  const XRectangle *rects = NULL;
-  if (pcache_reg) {
-    rects = pcache_reg->rects;
-    nrects = pcache_reg->nrects;
-  }
-  if (!rects) {
-    nrects = 0;
-    rects = rects_free = XFixesFetchRegion(ps->dpy, reg, &nrects);
-  }
-  // Use one empty rectangle if the region is empty
-  if (!nrects) {
-    cxfree(rects_free);
-    rects_free = NULL;
-    nrects = 1;
-    rects = &rect_blank;
-  }
+  int nrects;
+  const rect_t *rects = pixman_region32_rectangles((region_t *)reg, &nrects);
 
-  assert(nrects);
-  if (1 == nrects) {
+  if (nrects == 1) {
     glEnable(GL_SCISSOR_TEST);
-    glScissor(rects[0].x, ps->root_height - rects[0].y - rects[0].height,
-        rects[0].width, rects[0].height);
+    glScissor(rects[0].x1, ps->root_height-rects[0].y2,
+        rects[0].x2-rects[0].x1, rects[0].y2-rects[0].y1);
   }
-  else {
-    glEnable(GL_STENCIL_TEST);
-    glClear(GL_STENCIL_BUFFER_BIT);
-
-    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glDepthMask(GL_FALSE);
-    glStencilOp(GL_REPLACE, GL_KEEP, GL_KEEP);
-
-    glBegin(GL_QUADS);
-
-    for (int i = 0; i < nrects; ++i) {
-      GLint rx = rects[i].x;
-      GLint ry = ps->root_height - rects[i].y;
-      GLint rxe = rx + rects[i].width;
-      GLint rye = ry - rects[i].height;
-      GLint z = 0;
-
-#ifdef DEBUG_GLX
-      printf_dbgf("(): Rect %d: %d, %d, %d, %d\n", i, rx, ry, rxe, rye);
-#endif
-
-      glVertex3i(rx, ry, z);
-      glVertex3i(rxe, ry, z);
-      glVertex3i(rxe, rye, z);
-      glVertex3i(rx, rye, z);
-    }
-
-    glEnd();
-
-    glStencilOp(GL_KEEP, GL_KEEP, GL_KEEP);
-    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    // glDepthMask(GL_TRUE);
-  }
-
-  cxfree(rects_free);
 
   glx_check_err(ps);
 }
 
-#define P_PAINTREG_START() \
-  XserverRegion reg_new = None; \
-  XRectangle rec_all = { .x = dx, .y = dy, .width = width, .height = height }; \
-  XRectangle *rects = &rec_all; \
-  int nrects = 1; \
- \
-  if (ps->o.glx_no_stencil && reg_tgt) { \
-    if (pcache_reg) { \
-      rects = pcache_reg->rects; \
-      nrects = pcache_reg->nrects; \
-    } \
-    else { \
-      reg_new = XFixesCreateRegion(ps->dpy, &rec_all, 1); \
-      XFixesIntersectRegion(ps->dpy, reg_new, reg_new, reg_tgt); \
- \
-      nrects = 0; \
-      rects = XFixesFetchRegion(ps->dpy, reg_new, &nrects); \
-    } \
-  } \
+#define P_PAINTREG_START(var) \
+  region_t reg_new; \
+  int nrects; \
+  const rect_t *rects; \
+  pixman_region32_init_rect(&reg_new, dx, dy, width, height); \
+  pixman_region32_intersect(&reg_new, &reg_new, (region_t *)reg_tgt); \
+  rects = pixman_region32_rectangles(&reg_new, &nrects); \
   glBegin(GL_QUADS); \
  \
   for (int ri = 0; ri < nrects; ++ri) { \
-    XRectangle crect; \
-    rect_crop(&crect, &rects[ri], &rec_all); \
- \
-    if (!crect.width || !crect.height) \
-      continue; \
+    rect_t var = rects[ri];
 
 #define P_PAINTREG_END() \
   } \
   glEnd(); \
  \
-  if (rects && rects != &rec_all && !(pcache_reg && pcache_reg->rects == rects)) \
-    cxfree(rects); \
-  free_region(ps, &reg_new); \
+  pixman_region32_fini(&reg_new);
 
 static inline GLuint
 glx_gen_texture(session_t *ps, GLenum tex_tgt, int width, int height) {
@@ -1358,14 +976,15 @@ glx_copy_region_to_tex(session_t *ps, GLenum tex_tgt, int basex, int basey,
         dx, ps->root_height - dy - height, width, height);
 }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
 /**
  * Blur contents in a particular region.
+ *
+ * XXX seems to be way to complex for what it does
  */
 bool
 glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
     GLfloat factor_center,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg,
+    const region_t *reg_tgt,
     glx_blur_cache_t *pbc) {
   const bool more_passes = ps->psglx->blur_passes[1].prog;
   const bool have_scissors = glIsEnabled(GL_SCISSOR_TEST);
@@ -1378,9 +997,7 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
     pbc = &ibc;
 
   int mdx = dx, mdy = dy, mwidth = width, mheight = height;
-#ifdef DEBUG_GLX
-  printf_dbgf("(): %d, %d, %d, %d\n", mdx, mdy, mwidth, mheight);
-#endif
+  //log_trace("%d, %d, %d, %d", mdx, mdy, mwidth, mheight);
 
   /*
   if (ps->o.resize_damage > 0) {
@@ -1388,8 +1005,8 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
     for (int i = 0; i < MAX_BLUR_PASS; ++i) {
       XFixed *kern = ps->o.blur_kerns[i];
       if (!kern) break;
-      inc_x += XFixedToDouble(kern[0]) / 2;
-      inc_y += XFixedToDouble(kern[1]) / 2;
+      inc_x += XFIXED_TO_DOUBLE(kern[0]) / 2;
+      inc_y += XFIXED_TO_DOUBLE(kern[1]) / 2;
     }
     inc_x = min_i(ps->o.resize_damage, inc_x);
     inc_y = min_i(ps->o.resize_damage, inc_y);
@@ -1420,22 +1037,18 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
   pbc->width = mwidth;
   pbc->height = mheight;
   GLuint tex_scr2 = pbc->textures[1];
-#ifdef CONFIG_VSYNC_OPENGL_FBO
   if (more_passes && !pbc->fbo)
     glGenFramebuffers(1, &pbc->fbo);
   const GLuint fbo = pbc->fbo;
-#endif
 
   if (!tex_scr || (more_passes && !tex_scr2)) {
-    printf_errf("(): Failed to allocate texture.");
-    goto glx_conv_blur_dst_end;
+    log_error("Failed to allocate texture.");
+    goto glx_blur_dst_end;
   }
-#ifdef CONFIG_VSYNC_OPENGL_FBO
   if (more_passes && !fbo) {
-    printf_errf("(): Failed to allocate framebuffer.");
-    goto glx_conv_blur_dst_end;
+    log_error("Failed to allocate framebuffer.");
+    goto glx_blur_dst_end;
   }
-#endif
 
   // Read destination pixels into a texture
   glEnable(tex_tgt);
@@ -1475,7 +1088,6 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
     assert(tex_scr);
     glBindTexture(tex_tgt, tex_scr);
 
-#ifdef CONFIG_VSYNC_OPENGL_FBO
     if (!last_pass) {
       static const GLenum DRAWBUFS[2] = { GL_COLOR_ATTACHMENT0 };
       glBindFramebuffer(GL_FRAMEBUFFER, fbo);
@@ -1484,8 +1096,8 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
       glDrawBuffers(1, DRAWBUFS);
       if (glCheckFramebufferStatus(GL_FRAMEBUFFER)
           != GL_FRAMEBUFFER_COMPLETE) {
-        printf_errf("(): Framebuffer attachment failed.");
-        goto glx_conv_blur_dst_end;
+        log_error("Framebuffer attachment failed.");
+        goto glx_blur_dst_end;
       }
     }
     else {
@@ -1497,7 +1109,6 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
       if (have_stencil)
         glEnable(GL_STENCIL_TEST);
     }
-#endif
 
     // Color negation for testing...
     // glTexEnvf(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_COMBINE);
@@ -1514,27 +1125,22 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
       glUniform1f(ppass->unifm_factor_center, factor_center);
 
     {
-      P_PAINTREG_START();
-      {
-        const GLfloat rx = (crect.x - mdx) * texfac_x;
-        const GLfloat ry = (mheight - (crect.y - mdy)) * texfac_y;
-        const GLfloat rxe = rx + crect.width * texfac_x;
-        const GLfloat rye = ry - crect.height * texfac_y;
-        GLfloat rdx = crect.x - mdx;
-        GLfloat rdy = mheight - crect.y + mdy;
-        GLfloat rdxe = rdx + crect.width;
-        GLfloat rdye = rdy - crect.height;
-
+      P_PAINTREG_START(crect) {
+        const GLfloat rx = (crect.x1 - mdx) * texfac_x;
+        const GLfloat ry = (mheight - (crect.y1 - mdy)) * texfac_y;
+        const GLfloat rxe = rx + (crect.x2 - crect.x1) * texfac_x;
+        const GLfloat rye = ry - (crect.y2 - crect.y1) * texfac_y;
+        GLfloat rdx = crect.x1 - mdx;
+        GLfloat rdy = mheight - crect.y1 + mdy;
         if (last_pass) {
-          rdx = crect.x;
-          rdy = ps->root_height - crect.y;
-          rdxe = rdx + crect.width;
-          rdye = rdy - crect.height;
+          rdx = crect.x1;
+          rdy = ps->root_height - crect.y1;
         }
+        GLfloat rdxe = rdx + (crect.x2 - crect.x1);
+        GLfloat rdye = rdy - (crect.y2 - crect.y1);
 
-#ifdef DEBUG_GLX
-        printf_dbgf("(): %f, %f, %f, %f -> %f, %f, %f, %f\n", rx, ry, rxe, rye, rdx, rdy, rdxe, rdye);
-#endif
+        //log_trace("%f, %f, %f, %f -> %f, %f, %f, %f", rx, ry, rxe, rye, rdx,
+        //          rdy, rdxe, rdye);
 
         glTexCoord2f(rx, ry);
         glVertex3f(rdx, rdy, z);
@@ -1547,8 +1153,7 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
         glTexCoord2f(rx, rye);
         glVertex3f(rdx, rdye, z);
-      }
-      P_PAINTREG_END();
+      } P_PAINTREG_END();
     }
 
     glUseProgram(0);
@@ -1563,10 +1168,8 @@ glx_conv_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
   ret = true;
 
-glx_conv_blur_dst_end:
-#ifdef CONFIG_VSYNC_OPENGL_FBO
+glx_blur_dst_end:
   glBindFramebuffer(GL_FRAMEBUFFER, 0);
-#endif
   glBindTexture(tex_tgt, 0);
   glDisable(tex_tgt);
   if (have_scissors)
@@ -1844,11 +1447,10 @@ glx_blur_dst(session_t *ps, int dx, int dy, int width, int height, float z,
 
   return ret;
 }
-#endif
 
 bool
 glx_dim_dst(session_t *ps, int dx, int dy, int width, int height, float z,
-    GLfloat factor, XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
+    GLfloat factor, const region_t *reg_tgt) {
   // It's possible to dim in glx_render(), but it would be over-complicated
   // considering all those mess in color negation and modulation
   glEnable(GL_BLEND);
@@ -1856,12 +1458,12 @@ glx_dim_dst(session_t *ps, int dx, int dy, int width, int height, float z,
   glColor4f(0.0f, 0.0f, 0.0f, factor);
 
   {
-    P_PAINTREG_START();
-    {
-      GLint rdx = crect.x;
-      GLint rdy = ps->root_height - crect.y;
-      GLint rdxe = rdx + crect.width;
-      GLint rdye = rdy - crect.height;
+    P_PAINTREG_START(crect) {
+      // XXX what does all of these variables mean?
+      GLint rdx = crect.x1;
+      GLint rdy = ps->root_height - crect.y1;
+      GLint rdxe = rdx + (crect.x2 - crect.x1);
+      GLint rdye = rdy - (crect.y2 - crect.y1);
 
       glVertex3i(rdx, rdy, z);
       glVertex3i(rdxe, rdy, z);
@@ -1885,29 +1487,19 @@ glx_dim_dst(session_t *ps, int dx, int dy, int width, int height, float z,
  * @brief Render a region with texture data.
  */
 bool
-glx_render_(session_t *ps, const glx_texture_t *ptex,
+glx_render(session_t *ps, const glx_texture_t *ptex,
     int x, int y, int dx, int dy, int width, int height, int z,
     double opacity, bool argb, bool neg,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
-    , const glx_prog_main_t *pprogram
-#endif
+    const region_t *reg_tgt, const glx_prog_main_t *pprogram
     ) {
   if (!ptex || !ptex->texture) {
-    printf_errf("(): Missing texture.");
+    log_error("Missing texture.");
     return false;
   }
 
-#ifdef DEBUG_GLX_PAINTREG
-  glx_render_dots(ps, dx, dy, width, height, z, reg_tgt, pcache_reg);
-  return true;
-#endif
-
   argb = argb || (GLX_TEXTURE_FORMAT_RGBA_EXT ==
       ps->psglx->fbconfigs[ptex->depth]->texture_fmt);
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
   const bool has_prog = pprogram && pprogram->prog;
-#endif
   bool dual_texture = false;
 
   // It's required by legacy versions of OpenGL to enable texture target
@@ -1928,9 +1520,7 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
     glColor4f(opacity, opacity, opacity, opacity);
   }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
   if (!has_prog)
-#endif
   {
     // The default, fixed-function path
     // Color negation
@@ -2005,7 +1595,6 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
       }
     }
   }
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
   else {
     // Programmable path
     assert(pprogram->prog);
@@ -2017,11 +1606,9 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
     if (pprogram->unifm_tex >= 0)
       glUniform1i(pprogram->unifm_tex, 0);
   }
-#endif
 
-#ifdef DEBUG_GLX
-  printf_dbgf("(): Draw: %d, %d, %d, %d -> %d, %d (%d, %d) z %d\n", x, y, width, height, dx, dy, ptex->width, ptex->height, z);
-#endif
+  //log_trace("Draw: %d, %d, %d, %d -> %d, %d (%d, %d) z %d", x, y, width, height,
+  //          dx, dy, ptex->width, ptex->height, z);
 
   // Bind texture
   glBindTexture(ptex->target, ptex->texture);
@@ -2033,12 +1620,12 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
 
   // Painting
   {
-    P_PAINTREG_START();
-    {
-      GLfloat rx = (double) (crect.x - dx + x);
-      GLfloat ry = (double) (crect.y - dy + y);
-      GLfloat rxe = rx + (double) crect.width;
-      GLfloat rye = ry + (double) crect.height;
+    P_PAINTREG_START(crect) {
+      // XXX explain these variables
+      GLfloat rx = (double) (crect.x1 - dx + x);
+      GLfloat ry = (double) (crect.y1 - dy + y);
+      GLfloat rxe = rx + (double) (crect.x2 - crect.x1);
+      GLfloat rye = ry + (double) (crect.y2 - crect.y1);
       // Rectangle textures have [0-w] [0-h] while 2D texture has [0-1] [0-1]
       // Thanks to amonakov for pointing out!
       if (GL_TEXTURE_2D == ptex->target) {
@@ -2047,10 +1634,10 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
         rxe = rxe / ptex->width;
         rye = rye / ptex->height;
       }
-      GLint rdx = crect.x;
-      GLint rdy = ps->root_height - crect.y;
-      GLint rdxe = rdx + crect.width;
-      GLint rdye = rdy - crect.height;
+      GLint rdx = crect.x1;
+      GLint rdy = ps->root_height - crect.y1;
+      GLint rdxe = rdx + (crect.x2 - crect.x1);
+      GLint rdye = rdy - (crect.y2 - crect.y1);
 
       // Invert Y if needed, this may not work as expected, though. I don't
       // have such a FBConfig to test with.
@@ -2059,9 +1646,8 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
         rye = 1.0 - rye;
       }
 
-#ifdef DEBUG_GLX
-      printf_dbgf("(): Rect %d: %f, %f, %f, %f -> %d, %d, %d, %d\n", ri, rx, ry, rxe, rye, rdx, rdy, rdxe, rdye);
-#endif
+      //log_trace("Rect %d: %f, %f, %f, %f -> %d, %d, %d, %d", ri, rx, ry, rxe, rye,
+      //          rdx, rdy, rdxe, rdye);
 
 #define P_TEXCOORD(cx, cy) { \
   if (dual_texture) { \
@@ -2081,8 +1667,7 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
 
       P_TEXCOORD(rx, rye);
       glVertex3i(rdx, rdye, z);
-    }
-    P_PAINTREG_END();
+    } P_PAINTREG_END();
   }
 
   // Cleanup
@@ -2100,120 +1685,12 @@ glx_render_(session_t *ps, const glx_texture_t *ptex,
     glActiveTexture(GL_TEXTURE0);
   }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
   if (has_prog)
     glUseProgram(0);
-#endif
 
   glx_check_err(ps);
 
   return true;
-}
-
-/**
- * Render a region with color.
- */
-static void
-glx_render_color(session_t *ps, int dx, int dy, int width, int height, int z,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
-  static int color = 0;
-
-  color = color % (3 * 3 * 3 - 1) + 1;
-  glColor4f(1.0 / 3.0 * (color / (3 * 3)),
-      1.0 / 3.0 * (color % (3 * 3) / 3),
-      1.0 / 3.0 * (color % 3),
-      1.0f
-      );
-  z -= 0.2;
-
-  {
-    P_PAINTREG_START();
-    {
-      GLint rdx = crect.x;
-      GLint rdy = ps->root_height - crect.y;
-      GLint rdxe = rdx + crect.width;
-      GLint rdye = rdy - crect.height;
-
-      glVertex3i(rdx, rdy, z);
-      glVertex3i(rdxe, rdy, z);
-      glVertex3i(rdxe, rdye, z);
-      glVertex3i(rdx, rdye, z);
-    }
-    P_PAINTREG_END();
-  }
-  glColor4f(0.0f, 0.0f, 0.0f, 0.0f);
-
-  glx_check_err(ps);
-}
-
-/**
- * Render a region with dots.
- */
-static void
-glx_render_dots(session_t *ps, int dx, int dy, int width, int height, int z,
-    XserverRegion reg_tgt, const reg_data_t *pcache_reg) {
-  glColor4f(0.0f, 0.0f, 0.0f, 1.0f);
-  z -= 0.1;
-
-  {
-    P_PAINTREG_START();
-    {
-      static const GLint BLK_WID = 5, BLK_HEI = 5;
-
-      glEnd();
-      glPointSize(1.0);
-      glBegin(GL_POINTS);
-
-      GLint rdx = crect.x;
-      GLint rdy = ps->root_height - crect.y;
-      GLint rdxe = rdx + crect.width;
-      GLint rdye = rdy - crect.height;
-      rdx = (rdx) / BLK_WID * BLK_WID;
-      rdy = (rdy) / BLK_HEI * BLK_HEI;
-      rdxe = (rdxe) / BLK_WID * BLK_WID;
-      rdye = (rdye) / BLK_HEI * BLK_HEI;
-
-      for (GLint cdx = rdx; cdx < rdxe; cdx += BLK_WID)
-        for (GLint cdy = rdy; cdy > rdye; cdy -= BLK_HEI)
-          glVertex3i(cdx + BLK_WID / 2, cdy - BLK_HEI / 2, z);
-    }
-    P_PAINTREG_END();
-  }
-  glColor4f(0.0f, 0.0f, 0.0f, 0.0f);
-
-  glx_check_err(ps);
-}
-
-/**
- * Swap buffer with glXCopySubBufferMESA().
- */
-void
-glx_swap_copysubbuffermesa(session_t *ps, XserverRegion reg) {
-  int nrects = 0;
-  XRectangle *rects = XFixesFetchRegion(ps->dpy, reg, &nrects);
-
-  if (1 == nrects && rect_is_fullscreen(ps, rects[0].x, rects[0].y,
-        rects[0].width, rects[0].height)) {
-    glXSwapBuffers(ps->dpy, get_tgt_window(ps));
-  }
-  else {
-    glx_set_clip(ps, None, NULL);
-    for (int i = 0; i < nrects; ++i) {
-      const int x = rects[i].x;
-      const int y = ps->root_height - rects[i].y - rects[i].height;
-      const int wid = rects[i].width;
-      const int hei = rects[i].height;
-
-#ifdef DEBUG_GLX
-      printf_dbgf("(): %d, %d, %d, %d\n", x, y, wid, hei);
-#endif
-      ps->psglx->glXCopySubBufferProc(ps->dpy, get_tgt_window(ps), x, y, wid, hei);
-    }
-  }
-
-  glx_check_err(ps);
-
-  cxfree(rects);
 }
 
 /**
@@ -2231,7 +1708,7 @@ glx_take_screenshot(session_t *ps, int *out_length) {
   glGetIntegerv(GL_UNPACK_ALIGNMENT, &unpack_align_old);
   assert(unpack_align_old > 0);
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  unsigned char *buf = cmalloc(length, unsigned char);
+  auto buf = ccalloc(length, unsigned char);
   glReadBuffer(GL_FRONT);
   glReadPixels(0, 0, ps->root_width, ps->root_height, GL_RGB,
       GL_UNSIGNED_BYTE, buf);
@@ -2242,18 +1719,14 @@ glx_take_screenshot(session_t *ps, int *out_length) {
   return buf;
 }
 
-#ifdef CONFIG_VSYNC_OPENGL_GLSL
 GLuint
 glx_create_shader(GLenum shader_type, const char *shader_str) {
-#ifdef DEBUG_GLX_GLSL
-  printf("glx_create_shader(): ===\n%s\n===\n", shader_str);
-  fflush(stdout);
-#endif
+  log_trace("glx_create_shader(): ===\n%s\n===", shader_str);
 
   bool success = false;
   GLuint shader = glCreateShader(shader_type);
   if (!shader) {
-    printf_errf("(): Failed to create shader with type %#x.", shader_type);
+    log_error("Failed to create shader with type %#x.", shader_type);
     goto glx_create_shader_end;
   }
   glShaderSource(shader, 1, &shader_str, NULL);
@@ -2269,8 +1742,7 @@ glx_create_shader(GLenum shader_type, const char *shader_str) {
       if (log_len) {
         char log[log_len + 1];
         glGetShaderInfoLog(shader, log_len, NULL, log);
-        printf_errf("(): Failed to compile shader with type %d: %s",
-            shader_type, log);
+        log_error("Failed to compile shader with type %d: %s", shader_type, log);
       }
       goto glx_create_shader_end;
     }
@@ -2292,7 +1764,7 @@ glx_create_program(const GLuint * const shaders, int nshaders) {
   bool success = false;
   GLuint program = glCreateProgram();
   if (!program) {
-    printf_errf("(): Failed to create program.");
+    log_error("Failed to create program.");
     goto glx_create_program_end;
   }
 
@@ -2310,7 +1782,7 @@ glx_create_program(const GLuint * const shaders, int nshaders) {
       if (log_len) {
         char log[log_len + 1];
         glGetProgramInfoLog(program, log_len, NULL, log);
-        printf_errf("(): Failed to link program: %s", log);
+        log_error("Failed to link program: %s", log);
       }
       goto glx_create_program_end;
     }
@@ -2345,17 +1817,15 @@ glx_create_program_from_str(const char *vert_shader_str,
   if (frag_shader_str)
     frag_shader = glx_create_shader(GL_FRAGMENT_SHADER, frag_shader_str);
 
-  {
-    GLuint shaders[2];
-    int count = 0;
-    if (vert_shader)
-      shaders[count++] = vert_shader;
-    if (frag_shader)
-      shaders[count++] = frag_shader;
-    assert(count <= sizeof(shaders) / sizeof(shaders[0]));
-    if (count)
-      prog = glx_create_program(shaders, count);
-  }
+  GLuint shaders[2];
+  unsigned int count = 0;
+  if (vert_shader)
+    shaders[count++] = vert_shader;
+  if (frag_shader)
+    shaders[count++] = frag_shader;
+  assert(count <= sizeof(shaders) / sizeof(shaders[0]));
+  if (count)
+    prog = glx_create_program(shaders, count);
 
   if (vert_shader)
     glDeleteShader(vert_shader);
@@ -2364,5 +1834,3 @@ glx_create_program_from_str(const char *vert_shader_str,
 
   return prog;
 }
-#endif
-
