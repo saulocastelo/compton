@@ -127,13 +127,6 @@ const char * const VSYNC_STRS[NUM_VSYNC + 1] = {
   NULL
 };
 
-/// Names of blur_methods.
-const char * const BLUR_METHOD_STRS[NUM_BLRMTHD + 1] = {
-    "convolution",    // BLRMTHD_CONV
-    "kawase",         // BLRMTHD_KAWASE
-    NULL
-};
-
 /// Names of backends.
 const char * const BACKEND_STRS[NUM_BKEND + 1] = {
   "xrender",      // BKEND_XRENDER
@@ -862,15 +855,6 @@ map_win(session_t *ps, xcb_window_t id) {
   assert(!win_is_focused_real(ps, w));
 
   w->a.map_state = XCB_MAP_STATE_VIEWABLE;
-
-
-  if (!w->isOld) {
-    w->oldX = -10000;
-    w->oldY = -10000;
-    w->oldW = 0;
-    w->oldH = 0;
-  }
-
 
   cxinerama_win_upd_scr(ps, w);
 
@@ -2619,9 +2603,7 @@ session_init(session_t *ps_old, int argc, char **argv) {
       .blur_background_frame = false,
       .blur_background_fixed = false,
       .blur_background_blacklist = NULL,
-      .blur_method = BLRMTHD_CONV,
       .blur_kerns = { NULL },
-      .blur_strength = { .iterations = 3, .offset = 2.75 },
       .inactive_dim = 0.0,
       .inactive_dim_fixed = false,
       .invert_color_list = NULL,
