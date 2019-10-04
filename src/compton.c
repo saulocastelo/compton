@@ -5781,7 +5781,7 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
     { "no-fading-destroyed-argb", no_argument, NULL, 315 },
     { "force-win-blend", no_argument, NULL, 316 },
     { "glx-fshader-win", required_argument, NULL, 317 },
-	{ "transparency-color-filter", no_argument, NULL, 321 },
+	{ "transparency-color-filter", no_argument, NULL, 323 },
     { "version", no_argument, NULL, 318 },
     { "no-x-selection", no_argument, NULL, 319 },
     { "no-name-pixmap", no_argument, NULL, 320 },
@@ -6054,7 +6054,7 @@ get_cfg(session_t *ps, int argc, char *const *argv, bool first_pass) {
       P_CASEBOOL(313, xrender_sync_fence);
       P_CASEBOOL(315, no_fading_destroyed_argb);
       P_CASEBOOL(316, force_win_blend);
-	  case 321: {
+	  case 323: {
         ps->o.tommy_flag = true;
 		gtk_init(NULL, NULL);
 		GdkRGBA bg_color_win, bg_color_menu;
